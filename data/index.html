@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RFID і керування реле</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header><h1>RFID і керування реле</h1><span id="connectionState">Підключення...</span></header>
+  <main>
+    <section class="card">
+      <h2>Стан пристрою</h2>
+      <p>Останній UID: <strong id="lastUid">ще не зчитувалась</strong></p>
+      <p>PN532: <span id="nfcStatus">невідомо</span></p>
+      <p>Мережа: <strong id="netStatus">невідомо</strong></p>
+      <p>Час Києва: <strong id="kyivClock">очікується синхронізація NTP</strong></p>
+    </section>
+    <section class="card">
+      <h2>Керування реле</h2>
+      <label>Тривалість імпульсу, мс <input id="duration" type="number" min="50" max="60000" value="1000"></label>
+      <button id="saveDuration">Зберегти тривалість</button>
+      <div class="row">
+        <button data-pulse="1">Імпульс реле 1</button><button data-pulse="2">Імпульс реле 2</button>
+        <button data-pulse="3">Обидва реле</button>
+      </div>
+      <div class="row">
+        <button data-stop="1">Вимкнути 1</button><button data-stop="2">Вимкнути 2</button>
+        <button data-stop="3">Вимкнути обидва</button>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Картки та власники</h2>
+      <form id="searchForm" class="row">
+        <input id="cardSearch" type="search" placeholder="Пошук: UID, ПІБ, авто, дата народження">
+        <button type="submit">Знайти</button><button id="clearSearch" type="button">Очистити</button>
+      </form>
+      <p id="cardListStatus" role="status">Завантаження списку...</p>
+      <div class="tableWrap"><table><thead><tr><th>#</th><th>UID</th><th>Прізвище</th><th>Ім’я</th><th>По батькові</th><th>Авто</th><th>Народження</th><th>Реле</th><th>Дії</th></tr></thead><tbody id="cards"></tbody></table></div>
+    </section>
+    <section class="card">
+      <h2 id="cardFormTitle">Додати картку</h2>
+      <div class="fields">
+        <label>UID<input id="uid" maxlength="20" placeholder="AA BB CC DD"></label>
+        <label>Прізвище<input id="lastName" maxlength="63"></label>
+        <label>Ім’я<input id="firstName" maxlength="63"></label>
+        <label>По батькові<input id="middleName" maxlength="63"></label>
+        <label>Номер автомобіля<input id="vehicle" maxlength="23"></label>
+        <label>Дата народження<input id="birthDate" type="date"></label>
+        <label>Реле<select id="relay"><option value="1">1</option><option value="2">2</option><option value="3">1 і 2</option></select></label>
+      </div>
+      <div class="row"><button id="saveCard">Додати картку</button><button id="useLastUid" type="button">Підставити останній UID</button><button id="cancelEdit" type="button" hidden>Скасувати</button></div>
+      <p id="formStatus" role="status"></p>
+    </section>
+    <section class="card">
+      <h2>Останні зчитування та облік</h2>
+      <label>Останні 10 зчитаних UID / номерів авто<select id="recentUids"></select></label>
+      <div class="row"><button id="markArrived">Позначити «Прибув»</button><button id="markDeparted">Позначити «Вибув»</button></div>
+      <p id="attendanceStatus" role="status"></p>
+      <details><summary>10 карток, які найдовше не зчитувалися</summary><ol id="oldestReads"></ol></details>
+      <details><summary>10 найчастіше зчитаних UID</summary><ol id="frequentReads"></ol></details>
+      <div class="row">
+        <div><h3>Прибули (останні 10)</h3><ol id="arrivals"></ol></div>
+        <div><h3>Вибули (останні 10)</h3><ol id="departures"></ol></div>
+      </div>
+    </section>
+    <section class="card"><h2>Налаштування</h2><p><a href="/wifi">WiFi</a> · <a href="/mqtt">MQTT</a></p></section>
+  </main>
+</body>
+</html>

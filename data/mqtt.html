@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Налаштування MQTT</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/mqtt.js" defer></script>
+</head>
+<body><main><section class="card">
+  <h1>Налаштування MQTT</h1>
+  <form id="mqttForm">
+    <label>IP або ім’я хоста брокера<input id="host" maxlength="64"></label>
+    <label>Порт<input id="port" type="number" min="1" max="65535" value="1883" required></label>
+    <label>Логін<input id="user" maxlength="32"></label>
+    <label>Пароль (порожнє поле залишає поточний)<input id="pass" maxlength="64" type="password" autocomplete="new-password"></label>
+    <label>Базовий MQTT topic<input id="topic" maxlength="64" required></label>
+    <button type="submit">Зберегти</button>
+  </form>
+  <p>Порожня адреса брокера вимикає MQTT. Типовий порт — 1883.</p>
+  <p id="mqttStatus" role="status"></p><a href="/">Назад</a>
+</section></main></body>
+</html>

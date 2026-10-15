@@ -1,0 +1,8 @@
+.pio
+.venv/
+.vscode/
+compile_commands.json
+debug.log
+*.bin
+*.elf
+*.map
