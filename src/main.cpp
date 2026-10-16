@@ -20,6 +20,7 @@
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
+#include <SPI.h>
 #include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -27,8 +28,12 @@
 // -------------------- Піни --------------------
 #define I2C_SDA 33
 #define I2C_SCL 32
-#define PN532_IRQ 4
+#define PN532_IRQ 36
 #define PN532_RESET 5
+#define PN532_SPI_SCK 17
+#define PN532_SPI_MISO 35
+#define PN532_SPI_MOSI 13
+#define PN532_SPI_CS 4
 #define RELAY_1 14
 #define RELAY_2 15
 #define BUTTON_ADD 39   // GPIO39 не має внутрішньої підтяжки: потрібен зовнішній резистор 10 кОм до 3.3 V
@@ -69,6 +74,8 @@
 #define MQTT_MAX_TOPIC 65
 #define ADDR_CARD_FS_MARKER 1400
 #define ADDR_CARD_LITTLEFS_MARKER 1401
+#define ADDR_WIFI_FALLBACK_MARKER 1402
+#define WIFI_FALLBACK_MARKER 0x57494649UL
 
 struct __attribute__((packed)) CardRecord {
   char uid[UID_FIELD_SIZE];
@@ -95,11 +102,24 @@ AttendanceEvent attendanceEvents[MAX_ATTENDANCE_EVENTS_PER_TYPE * 2];
 uint8_t attendanceEventCount = 0;
 char recentScanUIDs[RECENT_SCAN_LIMIT][RECENT_UID_FIELD_SIZE];
 size_t recentScanCount = 0;
+char presentUIDs[MAX_CARDS][UID_FIELD_SIZE];
+size_t presentUIDCount = 0;
+SemaphoreHandle_t presenceMutex = nullptr;
 bool cardStatsDirty = false;
 unsigned long lastCardStatsSave = 0;
 
 bool isValidUIDFormat(const String &uid);
 String normalizeUIDInput(String in);
+int findCardIndexByUID(const String &uid);
+int findCardIndexByReference(const String &reference, bool byVehicle,
+                             bool &ambiguous);
+bool isUIDPresent(const String &uid);
+bool updateUIDPresence(const String &uid, bool present, bool &changed);
+String getPresenceJSON();
+bool applyPresenceState(const String &uid, bool present, const char *source,
+                        bool &changed, bool &historySaved);
+void publishMqttPresenceEvent(const String &uid, bool present,
+                              const char *source, uint8_t relayMask);
 bool addRecord(const String &uid, uint8_t relayMask);
 bool addRecord(const String &uid, uint8_t relayMask, const String &lastName,
                const String &firstName, const String &middleName,
@@ -112,12 +132,15 @@ uint8_t findUIDRelayMask(const String &uid);
 String getListJSON();
 bool initializeAttendanceStorage();
 bool saveAttendanceEvents();
+bool recordAttendanceEvent(const String &uid, bool arrived);
 void trackCardRead(const String &uid);
 void seedRecentScans();
 String getActivityJSON();
 
 // -------------------- PN532 --------------------
 Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET, &Wire);
+SPIClass pn532SPI(HSPI);
+Adafruit_PN532 nfc2(PN532_SPI_CS, &pn532SPI);
 
 // -------------------- Веб/Мережа --------------------
 AsyncWebServer asyncServer(80);
@@ -231,6 +254,7 @@ const char* webPass = "ChangeMe123!"; // Змініть на свій парол
 // -------------------- Змінні --------------------
 String lastScannedUID = "";
 bool nfcPresent = false;
+bool nfc2Present = false;
 int clickDuration = 1000;
 
 // Таймери реле
@@ -247,6 +271,11 @@ String presentedUID = "";
 unsigned long lastCardSeen = 0;
 unsigned long lastNfcInitAttempt = 0;
 unsigned long lastNfcFailureLog = 0;
+String presentedUID2 = "";
+unsigned long lastCardSeen2 = 0;
+unsigned long lastNFCRead2 = 0;
+unsigned long lastNfc2InitAttempt = 0;
+unsigned long lastNfc2FailureLog = 0;
 unsigned long lastNetworkCheck = 0;
 const unsigned long NFC_RETRY_INTERVAL = 5000;
 const unsigned long CARD_STATS_SAVE_INTERVAL = 60000;
@@ -255,6 +284,7 @@ unsigned long lastMqttStatusPublish = 0;
 const unsigned long MQTT_RETRY_INTERVAL = 5000;
 const unsigned long MQTT_STATUS_INTERVAL = 30000;
 bool lastPublishedNfcPresent = false;
+bool lastPublishedNfc2Present = false;
 bool wifiConnectPending = false;
 unsigned long wifiConnectPendingAt = 0;
 bool wifiScanInProgress = false;
@@ -286,6 +316,8 @@ String buildLiveStatusJSON(const char *type) {
   doc["type"] = type;
   doc["uid"] = lastScannedUID;
   doc["pn532"] = nfcPresent;
+  doc["pn532_1"] = nfcPresent;
+  doc["pn532_2"] = nfc2Present;
   doc["network"] = (currentNet == NET_ETH) ? "Ethernet" :
       (currentNet == NET_WIFI_STA) ? "WiFi" :
       (currentNet == NET_WIFI_AP) ? "AP" : "offline";
@@ -451,6 +483,118 @@ bool cardUIDExists(const String &uid) {
     if (uid == cardRecords[i].uid) return true;
   }
   return false;
+}
+
+int findCardIndexByUID(const String &uid) {
+  for (size_t i = 0; i < cardCount; i++) {
+    if (uid == cardRecords[i].uid) return (int)i;
+  }
+  return -1;
+}
+
+int findCardIndexByReference(const String &reference, bool byVehicle,
+                             bool &ambiguous) {
+  ambiguous = false;
+  if (!byVehicle) {
+    String uid = normalizeUIDInput(reference);
+    return isValidUIDFormat(uid) ? findCardIndexByUID(uid) : -1;
+  }
+
+  String normalizedVehicle = reference;
+  normalizedVehicle.trim();
+  normalizedVehicle.toUpperCase();
+  if (normalizedVehicle.length() == 0) return -1;
+
+  int match = -1;
+  for (size_t i = 0; i < cardCount; i++) {
+    String candidate = cardRecords[i].vehicle;
+    candidate.trim();
+    candidate.toUpperCase();
+    if (candidate != normalizedVehicle) continue;
+    if (match >= 0) {
+      ambiguous = true;
+      return -1;
+    }
+    match = (int)i;
+  }
+  return match;
+}
+
+bool isUIDPresent(const String &uid) {
+  if (!presenceMutex || xSemaphoreTake(presenceMutex, portMAX_DELAY) != pdTRUE) {
+    return false;
+  }
+  bool present = false;
+  for (size_t i = 0; i < presentUIDCount; i++) {
+    if (uid == presentUIDs[i]) {
+      present = true;
+      break;
+    }
+  }
+  xSemaphoreGive(presenceMutex);
+  return present;
+}
+
+bool updateUIDPresence(const String &uid, bool present, bool &changed) {
+  changed = false;
+  if (!presenceMutex || xSemaphoreTake(presenceMutex, portMAX_DELAY) != pdTRUE) {
+    return false;
+  }
+
+  size_t index = presentUIDCount;
+  for (size_t i = 0; i < presentUIDCount; i++) {
+    if (uid == presentUIDs[i]) {
+      index = i;
+      break;
+    }
+  }
+
+  if (present && index == presentUIDCount) {
+    if (presentUIDCount >= MAX_CARDS) {
+      xSemaphoreGive(presenceMutex);
+      return false;
+    }
+    copyCardField(presentUIDs[presentUIDCount], UID_FIELD_SIZE, uid);
+    presentUIDCount++;
+    changed = true;
+  } else if (!present && index < presentUIDCount) {
+    for (size_t i = index; i + 1 < presentUIDCount; i++) {
+      memcpy(presentUIDs[i], presentUIDs[i + 1], UID_FIELD_SIZE);
+    }
+    presentUIDCount--;
+    memset(presentUIDs[presentUIDCount], 0, UID_FIELD_SIZE);
+    changed = true;
+  }
+
+  xSemaphoreGive(presenceMutex);
+  return true;
+}
+
+String getPresenceJSON() {
+  JsonDocument doc;
+  JsonArray cards = doc["cards"].to<JsonArray>();
+  size_t presentCount = 0;
+  for (size_t i = 0; i < cardCount; i++) {
+    CardRecord &record = cardRecords[i];
+    bool present = isUIDPresent(String(record.uid));
+    presentCount += present ? 1 : 0;
+    JsonObject item = cards.add<JsonObject>();
+    item["index"] = i;
+    item["uid"] = record.uid;
+    item["relay"] = record.relayMask;
+    item["lastName"] = record.lastName;
+    item["firstName"] = record.firstName;
+    item["middleName"] = record.middleName;
+    item["vehicle"] = record.vehicle;
+    item["birthDate"] = record.birthDate;
+    item["present"] = present;
+  }
+  doc["total"] = cardCount;
+  doc["presentCount"] = presentCount;
+  doc["absentCount"] = cardCount - presentCount;
+  String json;
+  serializeJson(doc, json);
+  return json;
 }
 
 bool loadCardFile(const char *path) {
@@ -713,9 +857,16 @@ bool updateCardRecord(size_t index, uint8_t relayMask, const String &lastName,
 
 bool removeCardRecord(size_t index) {
   if (!cardStorageReady || index >= cardCount) return false;
+  String removedUID = cardRecords[index].uid;
   for (size_t i = index; i + 1 < cardCount; i++) cardRecords[i] = cardRecords[i + 1];
   cardCount--;
-  if (saveCardRecords()) return true;
+  if (saveCardRecords()) {
+    bool changed = false;
+    if (!updateUIDPresence(removedUID, false, changed)) {
+      Serial.println("Не вдалося прибрати видалену картку зі списку присутніх.");
+    }
+    return true;
+  }
   if (!loadCardFile(CARD_FILE)) {
     cardStorageReady = false;
     Serial.println("Помилка відновлення списку карток після невдалого видалення.");
@@ -880,6 +1031,53 @@ bool initializeAttendanceStorage() {
   return true;
 }
 
+bool recordAttendanceEvent(const String &uid, bool arrived) {
+  if (attendanceEventCount >= MAX_ATTENDANCE_EVENTS_PER_TYPE * 2) {
+    size_t oldestIndex = attendanceEventCount;
+    for (size_t i = 0; i < attendanceEventCount; i++) {
+      if (attendanceEvents[i].arrived == arrived) {
+        oldestIndex = i;
+        break;
+      }
+    }
+    if (oldestIndex == attendanceEventCount) oldestIndex = 0;
+    for (size_t i = oldestIndex; i + 1 < attendanceEventCount; i++) {
+      attendanceEvents[i] = attendanceEvents[i + 1];
+    }
+    attendanceEventCount--;
+  } else {
+    size_t typeCount = 0;
+    for (size_t i = 0; i < attendanceEventCount; i++) {
+      if (attendanceEvents[i].arrived == arrived) typeCount++;
+    }
+    if (typeCount >= MAX_ATTENDANCE_EVENTS_PER_TYPE) {
+      for (size_t i = 0; i < attendanceEventCount; i++) {
+        if (attendanceEvents[i].arrived == arrived) {
+          for (size_t j = i; j + 1 < attendanceEventCount; j++) {
+            attendanceEvents[j] = attendanceEvents[j + 1];
+          }
+          attendanceEventCount--;
+          break;
+        }
+      }
+    }
+  }
+
+  AttendanceEvent &event = attendanceEvents[attendanceEventCount++];
+  memset(&event, 0, sizeof(event));
+  copyCardField(event.uid, sizeof(event.uid), uid);
+  time_t now;
+  time(&now);
+  setAttendanceEventEpoch(event, now >= 1704067200 ? (uint32_t)now : 0);
+  event.arrived = arrived;
+  if (saveAttendanceEvents()) return true;
+
+  if (!initializeAttendanceStorage()) {
+    Serial.println("Не вдалося відновити журнал після помилки запису.");
+  }
+  return false;
+}
+
 void trackCardRead(const String &uid) {
   time_t now;
   time(&now);
@@ -996,10 +1194,18 @@ const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 String readWiFiSSID() { return eepromReadString(ADDR_WIFI_SSID, WIFI_MAX_SSID); }
 String readWiFiPass() { return eepromReadString(ADDR_WIFI_PASS, WIFI_MAX_PASS); }
-void writeWiFiCreds(const String &ssid, const String &pass) {
+bool isWiFiFallbackConfigured() {
+  uint32_t marker = 0;
+  EEPROM.get(ADDR_WIFI_FALLBACK_MARKER, marker);
+  return marker == WIFI_FALLBACK_MARKER;
+}
+bool writeWiFiCreds(const String &ssid, const String &pass) {
   eepromWriteString(ADDR_WIFI_SSID, ssid, WIFI_MAX_SSID);
   eepromWriteString(ADDR_WIFI_PASS, pass, WIFI_MAX_PASS);
-  EEPROM.commit();
+  EEPROM.put(ADDR_WIFI_FALLBACK_MARKER, WIFI_FALLBACK_MARKER);
+  if (!EEPROM.commit()) return false;
+  return isWiFiFallbackConfigured() && readWiFiSSID() == ssid &&
+         readWiFiPass() == pass;
 }
 
 String readMqttHost() { return eepromReadString(ADDR_MQTT_HOST, MQTT_MAX_HOST); }
@@ -1057,6 +1263,8 @@ void publishMqttStatus() {
               (currentNet == NET_WIFI_STA) ? WiFi.localIP().toString() :
               (currentNet == NET_WIFI_AP) ? WiFi.softAPIP().toString() : "";
   doc["pn532"] = nfcPresent;
+  doc["pn532_1"] = nfcPresent;
+  doc["pn532_2"] = nfc2Present;
   doc["relay1"] = relay1_active;
   doc["relay2"] = relay2_active;
   char payload[256];
@@ -1065,22 +1273,127 @@ void publishMqttStatus() {
     Serial.println("Не вдалося опублікувати MQTT status.");
   }
   lastPublishedNfcPresent = nfcPresent;
+  lastPublishedNfc2Present = nfc2Present;
   lastPublishedNet = currentNet;
   lastMqttStatusPublish = millis();
 }
 
-void publishMqttCard(const String &uid, uint8_t relayMask) {
+void publishMqttCard(const String &uid, uint8_t relayMask, const char *reader) {
   if (!mqttClient.connected()) return;
 
   JsonDocument doc;
   doc["uid"] = uid;
   doc["authorized"] = relayMask != 0;
   doc["relay"] = relayMask;
+  doc["reader"] = reader;
   char payload[128];
   size_t length = serializeJson(doc, payload, sizeof(payload));
   if (length == 0 || !mqttClient.publish(mqttTopic("event/card").c_str(), payload)) {
     Serial.println("Не вдалося опублікувати MQTT card event.");
   }
+}
+
+void publishMqttPresenceEvent(const String &uid, bool present,
+                              const char *source, uint8_t relayMask) {
+  if (!mqttClient.connected()) return;
+  JsonDocument doc;
+  doc["uid"] = uid;
+  int cardIndex = findCardIndexByUID(uid);
+  if (cardIndex >= 0) doc["vehicle"] = cardRecords[cardIndex].vehicle;
+  doc["present"] = present;
+  doc["source"] = source;
+  doc["relay"] = relayMask;
+  String payload;
+  serializeJson(doc, payload);
+  if (!mqttClient.publish(mqttTopic("event/presence").c_str(), payload.c_str())) {
+    Serial.println("Не вдалося опублікувати MQTT presence event.");
+  }
+}
+
+bool publishMqttCardList(const char *listName, int presenceFilter,
+                         const String &requestId) {
+  if (!mqttClient.connected()) return false;
+  const size_t recordsPerMessage = 4;
+  size_t recordCount = 0;
+  for (size_t i = 0; i < cardCount; i++) {
+    bool present = isUIDPresent(String(cardRecords[i].uid));
+    if (presenceFilter < 0 ||
+        (presenceFilter == 1 && present) ||
+        (presenceFilter == 0 && !present)) {
+      recordCount++;
+    }
+  }
+  size_t partCount = max((size_t)1,
+      (recordCount + recordsPerMessage - 1) / recordsPerMessage);
+  size_t sourceIndex = 0;
+  size_t partIndex = 0;
+
+  do {
+    JsonDocument doc;
+    doc["list"] = listName;
+    doc["part"] = partIndex + 1;
+    doc["parts"] = partCount;
+    if (requestId.length()) doc["requestId"] = requestId;
+    JsonArray items = doc["items"].to<JsonArray>();
+    size_t emitted = 0;
+    while (sourceIndex < cardCount && emitted < recordsPerMessage) {
+      size_t i = sourceIndex++;
+      bool present = isUIDPresent(String(cardRecords[i].uid));
+      if (presenceFilter >= 0 && present != (presenceFilter == 1)) continue;
+      const CardRecord &record = cardRecords[i];
+      JsonObject item = items.add<JsonObject>();
+      item["uid"] = record.uid;
+      item["lastName"] = record.lastName;
+      item["firstName"] = record.firstName;
+      item["middleName"] = record.middleName;
+      item["vehicle"] = record.vehicle;
+      item["birthDate"] = record.birthDate;
+      item["relay"] = record.relayMask;
+      item["present"] = present;
+      emitted++;
+    }
+
+    String payload;
+    serializeJson(doc, payload);
+    String topic = readMqttTopic() + "/data/" + listName;
+    if (payload.length() + topic.length() + 8 > mqttClient.getBufferSize() ||
+        !mqttClient.publish(topic.c_str(), payload.c_str())) {
+      Serial.print("Не вдалося опублікувати MQTT список ");
+      Serial.println(listName);
+      return false;
+    }
+    partIndex++;
+  } while (partIndex < partCount);
+
+  return true;
+}
+
+bool publishMqttPresenceLists(const String &requestId) {
+  bool cardsSent = publishMqttCardList("cards", -1, requestId);
+  bool presentSent = publishMqttCardList("present", 1, requestId);
+  bool absentSent = publishMqttCardList("absent", 0, requestId);
+  return cardsSent && presentSent && absentSent;
+}
+
+bool applyPresenceState(const String &uid, bool present, const char *source,
+                        bool &changed, bool &historySaved) {
+  changed = false;
+  historySaved = true;
+  if (!cardUIDExists(uid) || !updateUIDPresence(uid, present, changed)) {
+    return false;
+  }
+  if (!changed) return true;
+
+  if (!recordAttendanceEvent(uid, present)) {
+    historySaved = false;
+    Serial.println("Стан присутності оновлено в RAM, але журнал подій не збережено.");
+  }
+  uint8_t relayMask = findUIDRelayMask(uid);
+  publishMqttPresenceEvent(uid, present, source, relayMask);
+  if (webSocket.count() > 0) {
+    webSocket.textAll(buildLiveStatusJSON("presence"));
+  }
+  return true;
 }
 
 void publishMqttCommandResult(const char *command, bool ok) {
@@ -1105,6 +1418,63 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
   }
 
   String receivedTopic(topic);
+  if (receivedTopic == mqttTopic("cmd/presence")) {
+    String action = String(doc["action"] | "");
+    if (action == "list") {
+      String requestId = String(doc["requestId"] | "");
+      if (requestId.length() > 32) requestId.remove(32);
+      publishMqttCommandResult("presence-list",
+                               publishMqttPresenceLists(requestId));
+      return;
+    }
+
+    bool arriving = action == "arrive";
+    if (!arriving && action != "depart") {
+      publishMqttCommandResult("presence", false);
+      return;
+    }
+
+    String reference;
+    bool byVehicle = false;
+    if (doc["uid"].is<const char *>() &&
+        String(doc["uid"].as<const char *>()).length() > 0) {
+      reference = String(doc["uid"].as<const char *>());
+    } else if (doc["vehicle"].is<const char *>() &&
+               String(doc["vehicle"].as<const char *>()).length() > 0) {
+      reference = String(doc["vehicle"].as<const char *>());
+      byVehicle = true;
+    } else if (doc["id"].is<const char *>() &&
+               String(doc["id"].as<const char *>()).length() > 0) {
+      reference = String(doc["id"].as<const char *>());
+      String normalized = normalizeUIDInput(reference);
+      byVehicle = !isValidUIDFormat(normalized);
+    }
+
+    bool ambiguous = false;
+    int cardIndex = reference.length()
+        ? findCardIndexByReference(reference, byVehicle, ambiguous) : -1;
+    if (cardIndex < 0) {
+      publishMqttCommandResult("presence", false);
+      if (ambiguous) Serial.println("MQTT presence: номер авто відповідає кільком карткам.");
+      return;
+    }
+
+    String uid = cardRecords[cardIndex].uid;
+    uint8_t relayMask = cardRecords[cardIndex].relayMask;
+    bool changed = false;
+    bool historySaved = true;
+    if (!applyPresenceState(uid, arriving, "mqtt", changed, historySaved)) {
+      publishMqttCommandResult("presence", false);
+      return;
+    }
+    if (!historySaved) publishMqttCommandResult("presence-history", false);
+    pulseRelays(relayMask, (uint32_t)clickDuration);
+    publishMqttCard(uid, relayMask, "mqtt");
+    publishMqttCommandResult("presence", true);
+    publishMqttStatus();
+    return;
+  }
+
   if (receivedTopic == mqttTopic("cmd/relay")) {
     const char *action = doc["action"] | "";
     int mask = doc["mask"] | 0;
@@ -1151,6 +1521,9 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
       added = removeUIDRecord(uid);
     }
     publishMqttCommandResult("card", added);
+    if (added && webSocket.count() > 0) {
+      webSocket.textAll(buildLiveStatusJSON("cards"));
+    }
   }
 }
 
@@ -1166,6 +1539,7 @@ void serviceMqtt(unsigned long now) {
     mqttClient.loop();
     if (now - lastMqttStatusPublish >= MQTT_STATUS_INTERVAL ||
         lastPublishedNfcPresent != nfcPresent ||
+        lastPublishedNfc2Present != nfc2Present ||
         lastPublishedNet != currentNet) {
       publishMqttStatus();
     }
@@ -1201,7 +1575,8 @@ void serviceMqtt(unsigned long now) {
   bool subscriptionsOk =
       mqttClient.subscribe(mqttTopic("cmd/relay").c_str()) &&
       mqttClient.subscribe(mqttTopic("cmd/card/add").c_str()) &&
-      mqttClient.subscribe(mqttTopic("cmd/card/remove").c_str());
+      mqttClient.subscribe(mqttTopic("cmd/card/remove").c_str()) &&
+      mqttClient.subscribe(mqttTopic("cmd/presence").c_str());
   if (!subscriptionsOk) Serial.println("Не вдалося оформити всі MQTT-підписки.");
   publishMqttStatus();
 }
@@ -1239,6 +1614,79 @@ bool initializePN532() {
   nfcPresent = true;
   Serial.println("PN532 знайдено");
   return true;
+}
+
+bool initializePN532SPI() {
+  nfc2.begin();
+  uint32_t versiondata = nfc2.getFirmwareVersion();
+  if (!versiondata) {
+    nfc2Present = false;
+    return false;
+  }
+  nfc2.SAMConfig();
+  nfc2Present = true;
+  Serial.println("PN532 №2 знайдено в режимі SPI.");
+  return true;
+}
+
+void handleScannedCard(const String &uid, uint8_t readerNumber) {
+  lastScannedUID = uid;
+  Serial.print("PN532 №");
+  Serial.print(readerNumber);
+  Serial.print(" зчитав UID: ");
+  Serial.println(uid);
+
+  trackCardRead(uid);
+  uint8_t relayMask = findUIDRelayMask(uid);
+  bool authorized = relayMask != 0;
+  if (authorized) {
+    bool changed = false;
+    bool historySaved = true;
+    bool arriving = readerNumber == 1;
+    const char *source = readerNumber == 1 ? "reader1" : "reader2";
+    if (!applyPresenceState(uid, arriving, source, changed, historySaved)) {
+      Serial.println("Не вдалося оновити RAM-список присутніх UID.");
+    }
+    if (!historySaved) {
+      Serial.println("Попередження: журнал події не збережено, але стан RAM оновлено.");
+    }
+    pulseRelays(relayMask, (uint32_t)clickDuration);
+    Serial.print("Дозволена картка, реле: ");
+    Serial.println(relayMask);
+    if (readerNumber == 2 && !changed) {
+      Serial.println("Картка вже була відсутня; повторне вибуття проігноровано.");
+    }
+  } else {
+    Serial.println("UID відсутній у списку карток.");
+  }
+
+  publishMqttCard(uid, relayMask,
+                  readerNumber == 1 ? "reader1" : "reader2");
+  if (webSocket.count() > 0) {
+    webSocket.textAll(buildLiveStatusJSON("scan"));
+  }
+}
+
+void serviceNFCReader(Adafruit_PN532 &reader, bool readerReady,
+                      String &presented, unsigned long &lastSeen,
+                      unsigned long &lastRead, uint8_t readerNumber,
+                      unsigned long now) {
+  if (!readerReady || now - lastRead < NFC_POLL_INTERVAL) return;
+  lastRead = now;
+  uint8_t uid[7];
+  uint8_t uidLength = 0;
+  bool success = reader.readPassiveTargetID(
+      PN532_MIFARE_ISO14443A, uid, &uidLength, 20);
+  if (success && uidLength > 0) {
+    String currentUID = formatUID(uid, uidLength);
+    lastSeen = now;
+    if (currentUID != presented) {
+      presented = currentUID;
+      handleScannedCard(currentUID, readerNumber);
+    }
+  } else if (presented.length() > 0 && now - lastSeen >= CARD_REARM_MS) {
+    presented = "";
+  }
 }
 
 void serviceNetwork(unsigned long now) {
@@ -1285,7 +1733,7 @@ void serviceNetwork(unsigned long now) {
       return;
     }
     String ssid = readWiFiSSID();
-    if (ssid.length() > 0) {
+    if (isWiFiFallbackConfigured() && ssid.length() > 0) {
       Serial.println("Ethernet втрачено; пробую збережену WiFi-мережу.");
       WiFi.mode(WIFI_STA);
       WiFi.setSleep(false);
@@ -1313,8 +1761,8 @@ void serviceNetwork(unsigned long now) {
     if (now - networkPhaseStarted < ETH_WAIT_MS) return;
 
     String ssid = readWiFiSSID();
-    if (ssid.length() == 0) {
-      Serial.println("SSID не знайдено в EEPROM; вмикаю AP.");
+    if (!isWiFiFallbackConfigured() || ssid.length() == 0) {
+      Serial.println("Резервний WiFi не налаштований явно; вмикаю AP.");
       startWiFiAP("WT32-Config", "config1234");
       networkStartup = NET_START_DONE;
       return;
@@ -1528,74 +1976,74 @@ void handleActivityAPI() {
   server.send(200, "application/json", getActivityJSON());
 }
 
+void handlePresenceAPI() {
+  if (!server.authenticate(webUser, webPass)) { server.requestAuthentication(); return; }
+  server.send(200, "application/json", getPresenceJSON());
+}
+
 void handleAttendanceAPI() {
   if (!server.authenticate(webUser, webPass)) { server.requestAuthentication(); return; }
-  String uid = normalizeUIDInput(server.arg("uid"));
+  String uidInput = server.arg("uid");
+  String vehicleInput = server.arg("vehicle");
   String action = server.arg("action");
-  if (!isValidUIDFormat(uid) || (action != "arrive" && action != "depart")) {
+  if (action != "arrive" && action != "depart") {
     server.send(400, "application/json",
-                "{\"ok\":false,\"msg\":\"Виберіть UID і прибуття або вибуття\"}");
+                "{\"ok\":false,\"msg\":\"Вкажіть прибуття або вибуття\"}");
     return;
   }
-  if (attendanceEventCount >= MAX_ATTENDANCE_EVENTS_PER_TYPE * 2) {
-    size_t oldestIndex = attendanceEventCount;
-    for (size_t i = 0; i < attendanceEventCount; i++) {
-      if (attendanceEvents[i].arrived == (action == "arrive")) {
-        oldestIndex = i;
-        break;
-      }
-    }
-    if (oldestIndex == attendanceEventCount) oldestIndex = 0;
-    for (size_t i = oldestIndex; i + 1 < attendanceEventCount; i++) {
-      attendanceEvents[i] = attendanceEvents[i + 1];
-    }
-    attendanceEventCount--;
-  } else {
-    size_t typeCount = 0;
-    for (size_t i = 0; i < attendanceEventCount; i++) {
-      if (attendanceEvents[i].arrived == (action == "arrive")) typeCount++;
-    }
-    if (typeCount >= MAX_ATTENDANCE_EVENTS_PER_TYPE) {
-      for (size_t i = 0; i < attendanceEventCount; i++) {
-        if (attendanceEvents[i].arrived == (action == "arrive")) {
-          for (size_t j = i; j + 1 < attendanceEventCount; j++) {
-            attendanceEvents[j] = attendanceEvents[j + 1];
-          }
-          attendanceEventCount--;
-          break;
-        }
-      }
-    }
+  bool byVehicle = uidInput.length() == 0;
+  String reference = byVehicle ? vehicleInput : uidInput;
+  bool ambiguous = false;
+  int cardIndex = reference.length()
+      ? findCardIndexByReference(reference, byVehicle, ambiguous) : -1;
+  if (cardIndex < 0) {
+    server.send(ambiguous ? 409 : 404, "application/json",
+        ambiguous
+          ? "{\"ok\":false,\"msg\":\"Номер авто відповідає кільком карткам\"}"
+          : "{\"ok\":false,\"msg\":\"Вкажіть зареєстрований UID або номер авто\"}");
+    return;
   }
 
-  AttendanceEvent &event = attendanceEvents[attendanceEventCount++];
-  memset(&event, 0, sizeof(event));
-  copyCardField(event.uid, sizeof(event.uid), uid);
-  time_t now;
-  time(&now);
-  setAttendanceEventEpoch(event, now >= 1704067200 ? (uint32_t)now : 0);
-  event.arrived = action == "arrive";
-  if (!saveAttendanceEvents()) {
-    initializeAttendanceStorage();
+  String uid = cardRecords[cardIndex].uid;
+  bool changed = false;
+  bool historySaved = true;
+  if (!applyPresenceState(uid, action == "arrive", "web", changed, historySaved)) {
+    server.send(503, "application/json",
+                "{\"ok\":false,\"msg\":\"Не вдалося оновити список присутніх у RAM\"}");
+    return;
+  }
+  if (!historySaved) {
     server.send(500, "application/json",
-                "{\"ok\":false,\"msg\":\"Не вдалося зберегти журнал у SPIFFS\"}");
+        "{\"ok\":false,\"stateChanged\":true,\"msg\":\"Стан присутності оновлено, але журнал подій не збережено\"}");
     return;
   }
-
-  Serial.print("Журнал: UID ");
-  Serial.print(uid);
-  Serial.println(event.arrived ? " позначено як прибув." : " позначено як вибув.");
-  server.send(200, "application/json",
-              event.arrived
-                  ? "{\"ok\":true,\"msg\":\"Прибуття записано\"}"
-                  : "{\"ok\":true,\"msg\":\"Вибуття записано\"}");
+  JsonDocument response;
+  response["ok"] = true;
+  response["changed"] = changed;
+  response["present"] = action == "arrive";
+  response["msg"] = changed
+      ? (action == "arrive" ? "Прибуття записано" : "Вибуття записано")
+      : (action == "arrive" ? "UID вже позначений як присутній"
+                            : "UID вже був відсутній; помилок немає");
+  String json;
+  serializeJson(response, json);
+  server.send(200, "application/json", json);
 }
 
 void handleStatusAPI() {
   if (!server.authenticate(webUser, webPass)) { server.requestAuthentication(); return; }
   String network = (currentNet == NET_ETH) ? "Ethernet" : (currentNet == NET_WIFI_STA) ? "WiFi" : (currentNet == NET_WIFI_AP) ? "AP" : "offline";
   String ip = (currentNet == NET_ETH) ? ETH.localIP().toString() : (currentNet == NET_WIFI_STA) ? WiFi.localIP().toString() : (currentNet == NET_WIFI_AP) ? WiFi.softAPIP().toString() : "";
-  String json = "{\"uid\":\"" + lastScannedUID + "\",\"pn532\":" + String(nfcPresent ? "true" : "false") + ",\"network\":\"" + network + "\",\"ip\":\"" + ip + "\",\"duration\":" + String(clickDuration) + "}";
+  JsonDocument doc;
+  doc["uid"] = lastScannedUID;
+  doc["pn532"] = nfcPresent;
+  doc["pn532_1"] = nfcPresent;
+  doc["pn532_2"] = nfc2Present;
+  doc["network"] = network;
+  doc["ip"] = ip;
+  doc["duration"] = clickDuration;
+  String json;
+  serializeJson(doc, json);
   server.send(200, "application/json", json);
 }
 
@@ -1825,7 +2273,14 @@ void handleWiFiScan() {
     }
     wifiScanInProgress = false;
     WiFi.scanDelete();
-    server.send(500, "application/json", "{\"error\":\"Пошук WiFi завершився помилкою. Натисніть пошук ще раз.\"}");
+    Serial.print("WiFi scan завершився помилкою, код: ");
+    Serial.println(result);
+    JsonDocument doc;
+    doc["error"] = "Пошук WiFi завершився помилкою.";
+    doc["scanCode"] = result;
+    String response;
+    serializeJson(doc, response);
+    server.send(500, "application/json", response);
     return;
   }
 
@@ -1844,7 +2299,8 @@ void handleWiFiScan() {
   else if (mode == WIFI_AP) WiFi.mode(WIFI_AP_STA);
   WiFi.scanDelete();
 
-  int16_t started = WiFi.scanNetworks(true, true);
+  WiFi.setSleep(false);
+  int16_t started = WiFi.scanNetworks(true, true, false, 1000);
   if (started == WIFI_SCAN_RUNNING) {
     wifiScanInProgress = true;
     server.send(200, "application/json", "{\"scanning\":true}");
@@ -1854,7 +2310,14 @@ void handleWiFiScan() {
     sendScanResults(started);
     return;
   }
-  server.send(500, "application/json", "{\"error\":\"Не вдалося запустити пошук WiFi мереж\"}");
+  Serial.print("Не вдалося запустити WiFi scan, код: ");
+  Serial.println(started);
+  JsonDocument doc;
+  doc["error"] = "Не вдалося запустити пошук WiFi мереж.";
+  doc["scanCode"] = started;
+  String response;
+  serializeJson(doc, response);
+  server.send(500, "application/json", response);
 }
 
 String htmlEscape(const String &value);
@@ -1876,7 +2339,11 @@ void handleWiFiSaveLegacy() {
     if (pass.length() == 0 && ssid == readWiFiSSID()) {
       pass = readWiFiPass();
     }
-    writeWiFiCreds(ssid, pass);
+    if (!writeWiFiCreds(ssid, pass)) {
+      server.send(500, "text/plain",
+                  "Не вдалося надійно зберегти WiFi налаштування в EEPROM");
+      return;
+    }
     wifiConnectPending = true;
     wifiConnectPendingAt = millis() + 500;
     server.send(200, "text/html",
@@ -2034,7 +2501,11 @@ void handleWiFiSave() {
     return;
   }
   if (pass.length() == 0 && ssid == readWiFiSSID()) pass = readWiFiPass();
-  writeWiFiCreds(ssid, pass);
+  if (!writeWiFiCreds(ssid, pass)) {
+    server.send(500, "application/json",
+        "{\"ok\":false,\"msg\":\"Не вдалося надійно зберегти WiFi налаштування в EEPROM\"}");
+    return;
+  }
   wifiConnectPending = true;
   wifiConnectPendingAt = millis() + 500;
   server.send(200, "application/json",
@@ -2069,6 +2540,10 @@ void handleMqttSettingsLegacy() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  presenceMutex = xSemaphoreCreateMutex();
+  if (!presenceMutex) {
+    Serial.println("Не вдалося створити mutex для списку присутніх UID.");
+  }
 
   EEPROM.begin(EEPROM_SIZE);
   cardRecords = static_cast<CardRecord *>(calloc(MAX_CARDS, sizeof(CardRecord)));
@@ -2106,6 +2581,8 @@ void setup() {
   Serial.println("Запускаю Ethernet; NFC і реле працюють незалежно від мережі.");
   bool ethStarted = ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN, ETH_MDIO_PIN, ETH_TYPE, ETH_CLK_MODE);
   if (!ethStarted) Serial.println("Не вдалося запустити Ethernet PHY.");
+  pn532SPI.begin(PN532_SPI_SCK, PN532_SPI_MISO, PN532_SPI_MOSI,
+                 PN532_SPI_CS);
   setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
   tzset();
   networkPhaseStarted = millis();
@@ -2143,6 +2620,7 @@ void setup() {
   server.on("/api/search-log", HTTP_POST, handleSearchLogAPI);
   server.on("/api/activity", HTTP_GET, handleActivityAPI);
   server.on("/api/attendance", HTTP_POST, handleAttendanceAPI);
+  server.on("/api/presence", HTTP_GET, handlePresenceAPI);
   server.on("/api/status", HTTP_GET, handleStatusAPI);
   server.on("/api/mqtt-config", HTTP_GET, handleMqttConfigAPI);
   server.on("/api/add", HTTP_POST, handleAddAPI);
@@ -2158,13 +2636,15 @@ void setup() {
   server.on("/mqtt", HTTP_POST, handleMqttSettings);
   server.onNotFound(handleNotFound);
   server.begin();
-  mqttClient.setBufferSize(512);
+  mqttClient.setBufferSize(2048);
   Serial.println("Веб-сервер запущено на порті 80");
   Serial.println("Очікую IP Ethernet; якщо зв'язку не буде — підключу WiFi або локальну AP.");
 
   // Network and web startup must not wait for a PN532 I2C response.
   lastNfcInitAttempt = millis() - NFC_RETRY_INTERVAL;
   lastNfcFailureLog = millis() - 30000;
+  lastNfc2InitAttempt = millis() - NFC_RETRY_INTERVAL;
+  lastNfc2FailureLog = millis() - 30000;
 }
 
 // -------------------- Loop --------------------
@@ -2200,6 +2680,13 @@ void loop() {
       lastNfcFailureLog = now;
     }
   }
+  if (!nfc2Present && now - lastNfc2InitAttempt >= NFC_RETRY_INTERVAL) {
+    lastNfc2InitAttempt = now;
+    if (!initializePN532SPI() && now - lastNfc2FailureLog >= 30000) {
+      Serial.println("PN532 №2 не знайдено; перевірте режим SPI, SCK/MISO/MOSI/CS та живлення.");
+      lastNfc2FailureLog = now;
+    }
+  }
 
   // Hardware button (GPIO39 needs an external pull-up). Debounce its input
   // before treating a low level as a press.
@@ -2228,36 +2715,10 @@ void loop() {
     }
   }
 
-  // NFC опитування
-  if (nfcPresent && (now - lastNFCRead >= NFC_POLL_INTERVAL)) {
-    lastNFCRead = now;
-    uint8_t uid[7];
-    uint8_t uidLength = 0;
-    bool success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 20);
-    if (success && uidLength > 0) {
-      String currentUID = formatUID(uid, uidLength);
-      lastScannedUID = currentUID;
-      lastCardSeen = now;
-      if (currentUID != presentedUID) {
-        presentedUID = currentUID;
-        Serial.print("Зчитано UID: "); Serial.println(currentUID);
-        trackCardRead(currentUID);
-        if (webSocket.count() > 0) {
-          webSocket.textAll(buildLiveStatusJSON("scan"));
-        }
-        uint8_t mask = findUIDRelayMask(currentUID);
-        publishMqttCard(currentUID, mask);
-        if (mask != 0) {
-          pulseRelays(mask, (uint32_t)clickDuration);
-          Serial.print("Дозволена картка, реле: "); Serial.println(mask);
-        } else {
-          Serial.println("UID відсутній у списку");
-        }
-      }
-    } else if (presentedUID.length() > 0 && now - lastCardSeen >= CARD_REARM_MS) {
-      presentedUID = ""; // повторне прикладання тієї ж картки знову активує реле
-    }
-  }
+  serviceNFCReader(nfc, nfcPresent, presentedUID, lastCardSeen, lastNFCRead,
+                   1, now);
+  serviceNFCReader(nfc2, nfc2Present, presentedUID2, lastCardSeen2,
+                   lastNFCRead2, 2, now);
 
   delay(2);
 }

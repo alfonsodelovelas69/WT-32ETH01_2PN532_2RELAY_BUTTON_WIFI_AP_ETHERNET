@@ -13,7 +13,8 @@
     <section class="card">
       <h2>Стан пристрою</h2>
       <p>Останній UID: <strong id="lastUid">ще не зчитувалась</strong></p>
-      <p>PN532: <span id="nfcStatus">невідомо</span></p>
+      <p>PN532 №1 (I2C): <span id="nfcStatus">невідомо</span></p>
+      <p>PN532 №2 (SPI): <span id="nfc2Status">невідомо</span></p>
       <p>Мережа: <strong id="netStatus">невідомо</strong></p>
       <p>Час Києва: <strong id="kyivClock">очікується синхронізація NTP</strong></p>
     </section>
@@ -55,15 +56,24 @@
     </section>
     <section class="card">
       <h2>Останні зчитування та облік</h2>
-      <label>Останні 10 зчитаних UID / номерів авто<select id="recentUids"></select></label>
+      <h3>Останні 10 зчитаних UID / номерів авто</h3>
+      <div id="recentReads" class="activityGrid" role="group" aria-label="Останні зчитані картки"></div>
       <div class="row"><button id="markArrived">Позначити «Прибув»</button><button id="markDeparted">Позначити «Вибув»</button></div>
       <p id="attendanceStatus" role="status"></p>
       <details><summary>10 карток, які найдовше не зчитувалися</summary><ol id="oldestReads"></ol></details>
       <details><summary>10 найчастіше зчитаних UID</summary><ol id="frequentReads"></ol></details>
-      <div class="row">
-        <div><h3>Прибули (останні 10)</h3><ol id="arrivals"></ol></div>
-        <div><h3>Вибули (останні 10)</h3><ol id="departures"></ol></div>
+      <div class="activityColumns">
+        <div class="activityColumn"><h3>Прибули (останні 10)</h3><ol id="arrivals"></ol></div>
+        <div class="activityColumn"><h3>Вибули (останні 10)</h3><ol id="departures"></ol></div>
       </div>
+    </section>
+    <section class="card">
+      <h2>Присутні зараз <span id="presentCount">0</span></h2>
+      <p>Номерні рамки заповнюються автомобілями, позначеними як присутні. Натисніть на заповнену рамку, щоб вибрати авто; цей вибір не змінює стан присутності. Показано щонайменше шість місць, нові рамки додаються за потреби.</p>
+      <div id="presentVehicles" class="presenceGrid" aria-label="Присутні автомобілі"></div>
+      <p id="presenceStatus" role="status">Завантаження списку присутніх...</p>
+      <h3>Вибрані присутні автомобілі (до 10)</h3>
+      <div id="selectedVisitors" class="visitorGrid"></div>
     </section>
     <section class="card"><h2>Налаштування</h2><p><a href="/wifi">WiFi</a> · <a href="/mqtt">MQTT</a></p></section>
   </main>

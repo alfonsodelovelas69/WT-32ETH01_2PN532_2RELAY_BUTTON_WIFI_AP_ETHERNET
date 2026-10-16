@@ -3,7 +3,7 @@ async function request(url,options={}){
   const response=await fetch(url,{cache:"no-store",credentials:"same-origin",...options});
   const text=await response.text();
   let data;try{data=JSON.parse(text)}catch{throw new Error(text||`HTTP ${response.status}`)}
-  if(!response.ok)throw new Error(data.msg||data.error||`HTTP ${response.status}`);
+  if(!response.ok){const detail=data.scanCode!==undefined?` (код ${data.scanCode})`:"";throw new Error(`${data.msg||data.error||`HTTP ${response.status}`}${detail}`)}
   return data;
 }
 async function scanNetworks(){

@@ -9,14 +9,14 @@
 </head>
 <body><main><section class="card">
   <h1>WiFi для резервного підключення</h1>
-  <p>Ethernet залишиться основним, якщо він підключений.</p>
+  <p>Ethernet залишиться основним, якщо він підключений. WiFi як резерв буде використано лише після того, як ви вручну виберете та збережете свою мережу на цій сторінці. Старі збережені дані без такого підтвердження не використовуються.</p>
   <button id="scanNetworks" type="button">Знайти WiFi мережі</button>
   <p id="scanStatus" role="status"></p>
   <label>Видимі мережі<select id="networks"><option value="">Спочатку виконайте пошук</option></select></label>
   <form id="wifiForm">
     <label>Назва мережі (SSID)<input id="ssid" maxlength="32" required></label>
     <label>Пароль WiFi<input id="pass" maxlength="63" type="password" autocomplete="new-password"></label>
-    <p>Для відкритої мережі залиште пароль порожнім. Для поточної мережі порожнє поле залишає попередній пароль.</p>
+    <p>Виберіть власну мережу зі списку або введіть її назву. Для відкритої мережі залиште пароль порожнім. Для тієї самої мережі порожнє поле залишає попередній пароль.</p>
     <button type="submit">Зберегти та підключити</button>
   </form>
   <p id="wifiSaveStatus" role="status"></p><a href="/">Назад</a>
