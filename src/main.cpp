@@ -1595,7 +1595,7 @@ void handleStatusAPI() {
   if (!server.authenticate(webUser, webPass)) { server.requestAuthentication(); return; }
   String network = (currentNet == NET_ETH) ? "Ethernet" : (currentNet == NET_WIFI_STA) ? "WiFi" : (currentNet == NET_WIFI_AP) ? "AP" : "offline";
   String ip = (currentNet == NET_ETH) ? ETH.localIP().toString() : (currentNet == NET_WIFI_STA) ? WiFi.localIP().toString() : (currentNet == NET_WIFI_AP) ? WiFi.softAPIP().toString() : "";
-  String json = "{\"uid\":\"" + lastScannedUID + "\",\"pn532\":" + String(nfcPresent ? "true" : "false") + ",\"network\":\"" + network + "\",\"ip\":\"" + ip + "\"}";
+  String json = "{\"uid\":\"" + lastScannedUID + "\",\"pn532\":" + String(nfcPresent ? "true" : "false") + ",\"network\":\"" + network + "\",\"ip\":\"" + ip + "\",\"duration\":" + String(clickDuration) + "}";
   server.send(200, "application/json", json);
 }
 

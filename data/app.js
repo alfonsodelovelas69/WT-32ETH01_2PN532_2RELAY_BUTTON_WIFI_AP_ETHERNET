@@ -1,5 +1,5 @@
 const $=id=>document.getElementById(id);
-let records=[],editingIndex=null,clockEpoch=0,clockUpdatedAt=0,ws;
+let records=[],editingIndex=null,clockEpoch=0,clockUpdatedAt=0,ws,durationLoaded=false;
 
 async function api(url,options={}){
   const response=await fetch(url,{cache:"no-store",credentials:"same-origin",...options});
@@ -89,7 +89,7 @@ async function markAttendance(action){
   catch(error){$("attendanceStatus").textContent=`Помилка журналу: ${error.message}`}
 }
 async function refreshStatus(){
-  try{const s=await api("/api/status");$("lastUid").textContent=s.uid||"ще не зчитувалась";$("nfcStatus").textContent=s.pn532?"підключено":"не знайдено";$("netStatus").textContent=`${s.network} ${s.ip||""}`}
+  try{const s=await api("/api/status");$("lastUid").textContent=s.uid||"ще не зчитувалась";$("nfcStatus").textContent=s.pn532?"підключено":"не знайдено";$("netStatus").textContent=`${s.network} ${s.ip||""}`;if(!durationLoaded&&Number.isInteger(s.duration)){$("duration").value=s.duration;durationLoaded=true}}
   catch(error){$("connectionState").textContent=`Немає зв’язку: ${error.message}`}
 }
 function connectSocket(){
