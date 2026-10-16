@@ -10,6 +10,7 @@
 #include <Arduino.h>
 #include <ETH.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <DNSServer.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
@@ -24,6 +25,7 @@
 #include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/task.h>
 
 // -------------------- Піни --------------------
 #define I2C_SDA 33
@@ -76,6 +78,15 @@
 #define ADDR_CARD_LITTLEFS_MARKER 1401
 #define ADDR_WIFI_FALLBACK_MARKER 1402
 #define WIFI_FALLBACK_MARKER 0x57494649UL
+#define ADDR_MAIL_FROM 1410
+#define ADDR_MAIL_TO 1512
+#define ADDR_MAIL_APP_PASS 1614
+#define ADDR_MAIL_NOTICE_MARKER 1648
+#define ADDR_MAIL_NOTICE_NETWORK 1652
+#define ADDR_MAIL_NOTICE_IP 1653
+#define MAIL_MAX_ADDRESS 101
+#define MAIL_MAX_APP_PASS 33
+#define MAIL_NOTICE_MARKER 0x4D41494CUL
 
 struct __attribute__((packed)) CardRecord {
   char uid[UID_FIELD_SIZE];
@@ -277,6 +288,16 @@ unsigned long lastNFCRead2 = 0;
 unsigned long lastNfc2InitAttempt = 0;
 unsigned long lastNfc2FailureLog = 0;
 unsigned long lastNetworkCheck = 0;
+volatile bool mailTaskRunning = false;
+volatile bool mailTaskFinished = false;
+volatile bool mailTaskSucceeded = false;
+uint8_t pendingMailNetwork = 0;
+uint32_t pendingMailIP = 0;
+uint8_t lastMailNoticeNetwork = 0xFF;
+uint32_t lastMailNoticeIP = 0;
+uint32_t lastMailAttemptIP = 0;
+uint8_t lastMailAttemptNetwork = 0xFF;
+unsigned long lastMailAttemptAt = 0;
 const unsigned long NFC_RETRY_INTERVAL = 5000;
 const unsigned long CARD_STATS_SAVE_INTERVAL = 60000;
 unsigned long lastMqttAttempt = 0;
@@ -1194,6 +1215,30 @@ const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 String readWiFiSSID() { return eepromReadString(ADDR_WIFI_SSID, WIFI_MAX_SSID); }
 String readWiFiPass() { return eepromReadString(ADDR_WIFI_PASS, WIFI_MAX_PASS); }
+String readMailFrom() { return eepromReadString(ADDR_MAIL_FROM, MAIL_MAX_ADDRESS); }
+String readMailTo() { return eepromReadString(ADDR_MAIL_TO, MAIL_MAX_ADDRESS); }
+String readMailAppPass() {
+  return eepromReadString(ADDR_MAIL_APP_PASS, MAIL_MAX_APP_PASS);
+}
+bool validEmailAddress(const String &address) {
+  if (address.length() < 6 || address.length() >= MAIL_MAX_ADDRESS ||
+      address.indexOf('@') <= 0 || address.indexOf('@') != address.lastIndexOf('@') ||
+      address.indexOf('.') < address.indexOf('@') + 2 ||
+      address.endsWith(".") || address.indexOf(' ') >= 0 ||
+      address.indexOf('\r') >= 0 || address.indexOf('\n') >= 0) {
+    return false;
+  }
+  return true;
+}
+bool writeMailSettings(const String &from, const String &to,
+                       const String &appPass) {
+  eepromWriteString(ADDR_MAIL_FROM, from, MAIL_MAX_ADDRESS);
+  eepromWriteString(ADDR_MAIL_TO, to, MAIL_MAX_ADDRESS);
+  eepromWriteString(ADDR_MAIL_APP_PASS, appPass, MAIL_MAX_APP_PASS);
+  if (!EEPROM.commit()) return false;
+  return readMailFrom() == from && readMailTo() == to &&
+         readMailAppPass() == appPass;
+}
 bool isWiFiFallbackConfigured() {
   uint32_t marker = 0;
   EEPROM.get(ADDR_WIFI_FALLBACK_MARKER, marker);
@@ -1206,6 +1251,253 @@ bool writeWiFiCreds(const String &ssid, const String &pass) {
   if (!EEPROM.commit()) return false;
   return isWiFiFallbackConfigured() && readWiFiSSID() == ssid &&
          readWiFiPass() == pass;
+}
+
+static const char GTS_ROOT_R1[] =
+    "-----BEGIN CERTIFICATE-----\n"
+    "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\n"
+    "bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c\n"
+    "-----END CERTIFICATE-----\n";
+
+String smtpBase64(const String &input) {
+  static const char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String encoded;
+  encoded.reserve(((input.length() + 2) / 3) * 4);
+  for (size_t i = 0; i < input.length(); i += 3) {
+    uint32_t value = (uint8_t)input[i] << 16;
+    bool haveSecond = i + 1 < input.length();
+    bool haveThird = i + 2 < input.length();
+    if (haveSecond) value |= (uint8_t)input[i + 1] << 8;
+    if (haveThird) value |= (uint8_t)input[i + 2];
+    encoded += alphabet[(value >> 18) & 0x3F];
+    encoded += alphabet[(value >> 12) & 0x3F];
+    encoded += haveSecond ? alphabet[(value >> 6) & 0x3F] : '=';
+    encoded += haveThird ? alphabet[value & 0x3F] : '=';
+  }
+  return encoded;
+}
+
+int smtpReadResponse(WiFiClientSecure &client, String &response) {
+  response = "";
+  String line;
+  unsigned long started = millis();
+  while (millis() - started < 12000) {
+    while (client.available()) {
+      char ch = (char)client.read();
+      if (ch != '\n') {
+        if (ch != '\r') line += ch;
+        continue;
+      }
+      response += line;
+      response += '\n';
+      if (line.length() >= 3 && isDigit(line[0]) &&
+          isDigit(line[1]) && isDigit(line[2])) {
+        int code = line.substring(0, 3).toInt();
+        bool moreLines = line.length() > 3 && line[3] == '-';
+        line = "";
+        if (!moreLines) return code;
+      } else {
+        line = "";
+      }
+    }
+    if (!client.connected() && !client.available()) return 0;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  return 0;
+}
+
+bool smtpCommand(WiFiClientSecure &client, const String &command,
+                 int expectedCode, String &response) {
+  client.print(command);
+  client.print("\r\n");
+  int code = smtpReadResponse(client, response);
+  if (code != expectedCode) {
+    Serial.print("SMTP: очікувався код ");
+    Serial.print(expectedCode);
+    Serial.print(", отримано ");
+    Serial.println(code);
+    return false;
+  }
+  return true;
+}
+
+struct MailNotice {
+  char sender[MAIL_MAX_ADDRESS];
+  char recipient[MAIL_MAX_ADDRESS];
+  char appPass[MAIL_MAX_APP_PASS];
+  char network[12];
+  char ip[16];
+  uint8_t networkCode;
+  uint32_t ipValue;
+};
+
+bool sendIpNotice(const MailNotice &notice) {
+  WiFiClientSecure client;
+  client.setCACert(GTS_ROOT_R1);
+  client.setTimeout(12);
+  if (!client.connect("smtp.gmail.com", 465)) {
+    Serial.println("Email: TLS-підключення до Gmail SMTP не вдалося.");
+    return false;
+  }
+
+  String response;
+  if (smtpReadResponse(client, response) != 220 ||
+      !smtpCommand(client, "EHLO wt32-eth01", 250, response) ||
+      !smtpCommand(client, "AUTH LOGIN", 334, response) ||
+      !smtpCommand(client, smtpBase64(notice.sender), 334, response) ||
+      !smtpCommand(client, smtpBase64(notice.appPass), 235, response) ||
+      !smtpCommand(client, "MAIL FROM:<" + String(notice.sender) + ">", 250,
+                   response)) {
+    client.stop();
+    return false;
+  }
+  int rcptCode = 0;
+  client.print("RCPT TO:<");
+  client.print(notice.recipient);
+  client.print(">\r\n");
+  rcptCode = smtpReadResponse(client, response);
+  if (rcptCode != 250 && rcptCode != 251) {
+    Serial.print("Email: Gmail відхилив одержувача, код ");
+    Serial.println(rcptCode);
+    client.stop();
+    return false;
+  }
+  if (!smtpCommand(client, "DATA", 354, response)) {
+    client.stop();
+    return false;
+  }
+
+  client.print("From: WT32-ETH01 <");
+  client.print(notice.sender);
+  client.print(">\r\nTo: <");
+  client.print(notice.recipient);
+  client.print(">\r\nSubject: WT32-ETH01 network address\r\n");
+  client.print("MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n");
+  client.print("WT32-ETH01 is available via ");
+  client.print(notice.network);
+  client.print(".\r\nIP address: http://");
+  client.print(notice.ip);
+  client.print("\r\n");
+  client.print(".\r\n");
+  int dataCode = smtpReadResponse(client, response);
+  bool sent = dataCode == 250;
+  if (!sent) {
+    Serial.print("Email: Gmail не прийняв повідомлення, код ");
+    Serial.println(dataCode);
+  }
+  client.print("QUIT\r\n");
+  client.stop();
+  return sent;
+}
+
+void sendIpNoticeTask(void *argument) {
+  MailNotice *notice = static_cast<MailNotice *>(argument);
+  mailTaskSucceeded = sendIpNotice(*notice);
+  vPortFree(notice);
+  mailTaskFinished = true;
+  vTaskDelete(nullptr);
+}
+
+IPAddress currentNetworkIP() {
+  if (currentNet == NET_ETH) return ETH.localIP();
+  if (currentNet == NET_WIFI_STA) return WiFi.localIP();
+  return IPAddress(0, 0, 0, 0);
+}
+
+void serviceMailNotifications() {
+  if (mailTaskFinished) {
+    mailTaskFinished = false;
+    mailTaskRunning = false;
+    if (mailTaskSucceeded) {
+      EEPROM.write(ADDR_MAIL_NOTICE_NETWORK, pendingMailNetwork);
+      EEPROM.put(ADDR_MAIL_NOTICE_IP, pendingMailIP);
+      EEPROM.put(ADDR_MAIL_NOTICE_MARKER, MAIL_NOTICE_MARKER);
+      if (!EEPROM.commit()) {
+        Serial.println("Email: лист надіслано, але стан сповіщення не збережено.");
+      }
+      lastMailNoticeNetwork = pendingMailNetwork;
+      lastMailNoticeIP = pendingMailIP;
+      Serial.println("Email: IP-повідомлення успішно надіслано.");
+    } else {
+      Serial.println("Email: надсилання не вдалося; повторю спробу через 5 хвилин.");
+    }
+  }
+
+  if (mailTaskRunning || (currentNet != NET_ETH && currentNet != NET_WIFI_STA))
+    return;
+  String sender = readMailFrom();
+  String recipient = readMailTo();
+  String appPass = readMailAppPass();
+  if (!sender.length() || !recipient.length() || !appPass.length()) return;
+  time_t now;
+  time(&now);
+  if (now < 1704067200) return;
+
+  IPAddress ip = currentNetworkIP();
+  if (ip == IPAddress(0, 0, 0, 0)) return;
+  uint8_t network = (uint8_t)currentNet;
+  uint32_t ipValue = (uint32_t)ip;
+  if (network == lastMailNoticeNetwork && ipValue == lastMailNoticeIP) return;
+  if (network == lastMailAttemptNetwork && ipValue == lastMailAttemptIP &&
+      millis() - lastMailAttemptAt < 300000UL) return;
+
+  MailNotice *notice = static_cast<MailNotice *>(pvPortMalloc(sizeof(MailNotice)));
+  if (!notice) {
+    Serial.println("Email: недостатньо пам’яті для підготовки сповіщення.");
+    return;
+  }
+  memset(notice, 0, sizeof(*notice));
+  strlcpy(notice->sender, sender.c_str(), sizeof(notice->sender));
+  strlcpy(notice->recipient, recipient.c_str(), sizeof(notice->recipient));
+  strlcpy(notice->appPass, appPass.c_str(), sizeof(notice->appPass));
+  strlcpy(notice->network, currentNet == NET_ETH ? "Ethernet" : "WiFi",
+          sizeof(notice->network));
+  String ipText = ip.toString();
+  strlcpy(notice->ip, ipText.c_str(), sizeof(notice->ip));
+  notice->networkCode = network;
+  notice->ipValue = ipValue;
+  pendingMailNetwork = network;
+  pendingMailIP = ipValue;
+  lastMailAttemptNetwork = network;
+  lastMailAttemptIP = ipValue;
+  lastMailAttemptAt = millis();
+  mailTaskRunning = true;
+  mailTaskFinished = false;
+  BaseType_t result = xTaskCreatePinnedToCore(
+      sendIpNoticeTask, "ip-mail-notice", 8192, notice, 1, nullptr, 0);
+  if (result != pdPASS) {
+    mailTaskRunning = false;
+    vPortFree(notice);
+    Serial.println("Email: не вдалося запустити задачу надсилання.");
+  }
 }
 
 String readMqttHost() { return eepromReadString(ADDR_MQTT_HOST, MQTT_MAX_HOST); }
@@ -1902,6 +2194,22 @@ void handleRootLegacy() {
 }
 
 void handleRoot() {
+  if (apActive) {
+    const String html =
+        "<!doctype html><html lang='uk'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Налаштування приладу</title>"
+        "<style>body{font:16px Arial,sans-serif;margin:0;padding:20px;background:#f3f5f7;color:#202124}"
+        "main{max-width:480px;margin:8vh auto;background:#fff;padding:24px;border-radius:12px;"
+        "box-shadow:0 2px 12px #0002;text-align:center}a{display:inline-block;margin:12px;padding:12px 20px;"
+        "border-radius:8px;background:#1769aa;color:#fff;text-decoration:none;font-weight:bold}</style>"
+        "<main><h1>Налаштування приладу</h1>"
+        "<p>Пристрій створив тимчасову WiFi-мережу для налаштування.</p>"
+        "<a href='/wifi'>Відкрити налаштування WiFi</a></main></html>";
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    server.send(200, "text/html; charset=utf-8", html);
+    return;
+  }
   if (!server.authenticate(webUser, webPass)) { server.requestAuthentication(); return; }
   if (!LittleFS.exists("/index.html")) {
     Serial.println("HTTP /: /index.html відсутній у LittleFS; завантажте web-файли командою uploadfs.");
@@ -2446,6 +2754,65 @@ void handleMqttConfigAPI() {
   server.send(200, "application/json", response);
 }
 
+void handleMailSettingsAPI() {
+  if (!server.authenticate(webUser, webPass)) {
+    server.requestAuthentication();
+    return;
+  }
+  if (server.method() == HTTP_GET) {
+    JsonDocument doc;
+    doc["sender"] = readMailFrom();
+    doc["recipient"] = readMailTo();
+    doc["appPassConfigured"] = readMailAppPass().length() > 0;
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+    return;
+  }
+
+  String sender = server.arg("sender");
+  String recipient = server.arg("recipient");
+  String appPass = server.arg("appPass");
+  sender.trim();
+  recipient.trim();
+  appPass.replace(" ", "");
+
+  if (sender.length() == 0 && recipient.length() == 0 &&
+      appPass.length() == 0) {
+    if (!writeMailSettings("", "", "")) {
+      server.send(500, "application/json",
+                  "{\"ok\":false,\"msg\":\"Не вдалося видалити email-налаштування\"}");
+      return;
+    }
+    server.send(200, "application/json",
+                "{\"ok\":true,\"msg\":\"Email-сповіщення вимкнено.\"}");
+    return;
+  }
+  if (!validEmailAddress(sender) || !validEmailAddress(recipient) ||
+      sender.length() >= MAIL_MAX_ADDRESS ||
+      recipient.length() >= MAIL_MAX_ADDRESS ||
+      appPass.length() >= MAIL_MAX_APP_PASS) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"msg\":\"Перевірте адреси email і довжину пароля застосунку Gmail\"}");
+    return;
+  }
+  if (appPass.length() == 0 && sender == readMailFrom()) {
+    appPass = readMailAppPass();
+  }
+  if (appPass.length() == 0) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"msg\":\"Введіть пароль застосунку Gmail\"}");
+    return;
+  }
+  if (!writeMailSettings(sender, recipient, appPass)) {
+    server.send(500, "application/json",
+                "{\"ok\":false,\"msg\":\"Не вдалося зберегти email-налаштування в EEPROM\"}");
+    return;
+  }
+  server.send(200, "application/json",
+              "{\"ok\":true,\"msg\":\"Email-налаштування збережено. Пароль застосунку не відображається.\"}");
+}
+
 void handleStaticWiFiPage() {
   if (!server.authenticate(webUser, webPass)) { server.requestAuthentication(); return; }
   server.request->send(LittleFS, "/wifi.html", "text/html");
@@ -2546,6 +2913,12 @@ void setup() {
   }
 
   EEPROM.begin(EEPROM_SIZE);
+  uint32_t mailNoticeMarker = 0;
+  EEPROM.get(ADDR_MAIL_NOTICE_MARKER, mailNoticeMarker);
+  if (mailNoticeMarker == MAIL_NOTICE_MARKER) {
+    lastMailNoticeNetwork = EEPROM.read(ADDR_MAIL_NOTICE_NETWORK);
+    EEPROM.get(ADDR_MAIL_NOTICE_IP, lastMailNoticeIP);
+  }
   cardRecords = static_cast<CardRecord *>(calloc(MAX_CARDS, sizeof(CardRecord)));
   if (!cardRecords) {
     Serial.println("Не вдалося виділити пам’ять для реєстру карток.");
@@ -2623,6 +2996,8 @@ void setup() {
   server.on("/api/presence", HTTP_GET, handlePresenceAPI);
   server.on("/api/status", HTTP_GET, handleStatusAPI);
   server.on("/api/mqtt-config", HTTP_GET, handleMqttConfigAPI);
+  server.on("/api/mail-settings", HTTP_GET, handleMailSettingsAPI);
+  server.on("/api/mail-settings", HTTP_POST, handleMailSettingsAPI);
   server.on("/api/add", HTTP_POST, handleAddAPI);
   server.on("/api/update", HTTP_POST, handleUpdateCardAPI);
   server.on("/api/add-last", HTTP_POST, handleAddLastAPI);
@@ -2656,6 +3031,7 @@ void loop() {
   serviceRelays(now);
   serviceNetwork(now);
   ensureTimeSync();
+  serviceMailNotifications();
   serviceMqtt(now);
   if (now - lastWebSocketBroadcast >= 1000) {
     lastWebSocketBroadcast = now;

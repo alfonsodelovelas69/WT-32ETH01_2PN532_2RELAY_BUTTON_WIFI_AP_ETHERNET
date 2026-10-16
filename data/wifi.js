@@ -22,10 +22,26 @@ async function scanNetworks(){
 document.addEventListener("DOMContentLoaded",()=>{
   $("scanNetworks").onclick=scanNetworks;
   $("networks").onchange=()=>{if($("networks").value)$("ssid").value=$("networks").value};
+  request("/api/mail-settings").then(settings=>{
+    $("mailSender").value=settings.sender||"";
+    $("mailRecipient").value=settings.recipient||"";
+    $("mailSaveStatus").textContent=settings.appPassConfigured
+      ?"Пароль застосунку збережений. Залиште поле порожнім, щоб не змінювати його."
+      :"Email-сповіщення ще не налаштовано.";
+  }).catch(error=>{$("mailSaveStatus").textContent=`Не вдалося завантажити email-налаштування: ${error.message}`});
   $("wifiForm").onsubmit=async event=>{
     event.preventDefault();const button=event.submitter;button.disabled=true;
     try{const result=await request("/wifi",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ssid:$("ssid").value,pass:$("pass").value})});$("wifiSaveStatus").textContent=result.msg}
     catch(error){$("wifiSaveStatus").textContent=`Не вдалося зберегти: ${error.message}`}
+    finally{button.disabled=false}
+  };
+  $("mailForm").onsubmit=async event=>{
+    event.preventDefault();const button=event.submitter;button.disabled=true;
+    try{
+      const result=await request("/api/mail-settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sender:$("mailSender").value,recipient:$("mailRecipient").value,appPass:$("mailAppPass").value})});
+      $("mailAppPass").value="";
+      $("mailSaveStatus").textContent=result.msg;
+    }catch(error){$("mailSaveStatus").textContent=`Не вдалося зберегти email-налаштування: ${error.message}`}
     finally{button.disabled=false}
   };
   scanNetworks();

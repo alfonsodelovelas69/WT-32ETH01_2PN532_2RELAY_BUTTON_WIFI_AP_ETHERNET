@@ -56,7 +56,7 @@ function detectPlateRegion(plate){
 }
 function dateText(epoch){return epoch?new Date(epoch*1000).toLocaleString("uk-UA",{timeZone:"Europe/Kyiv"}):"час не синхронізовано"}
 function renderCards(){
-  const query=normalize($("cardSearch").value),body=$("cards");body.replaceChildren();
+  const query=normalize($("cardSearch").value),body=$("cards"),tableWrap=body.closest(".tableWrap");body.replaceChildren();
   const visible=records.filter(x=>{
     const initials=[x.firstName,x.middleName].map(v=>Array.from(v||"")[0]||"").join("");
     const date=(x.birthDate||"").split("-"),local=date.length===3?`${date[2]}.${date[1]}.${date[0]}`:"";
@@ -72,6 +72,10 @@ function renderCards(){
     edit.onclick=()=>startEdit(x);remove.onclick=()=>removeCard(x,remove);
     actions.append(edit,remove);row.appendChild(actions);body.appendChild(row);
   }
+  const rows=Array.from(body.rows);
+  tableWrap.style.maxHeight=rows.length>10
+    ? `${$("cards").closest("table").tHead.offsetHeight+rows.slice(0,10).reduce((height,row)=>height+row.offsetHeight,0)}px`
+    :"";
   $("cardListStatus").textContent=`Показано ${visible.length} із ${records.length} карток`;
   renderRankings();
 }
