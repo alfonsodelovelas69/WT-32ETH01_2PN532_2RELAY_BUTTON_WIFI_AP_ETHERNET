@@ -21,6 +21,8 @@
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <time.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // -------------------- Піни --------------------
 #define I2C_SDA 33
@@ -125,12 +127,20 @@ class AsyncServerFacade {
 public:
   AsyncWebServerRequest *request = nullptr;
   JsonDocument jsonBody;
+  SemaphoreHandle_t requestMutex = nullptr;
 
-  void begin() { asyncServer.begin(); }
+  void begin() {
+    requestMutex = xSemaphoreCreateMutex();
+    if (!requestMutex) {
+      Serial.println("Не вдалося створити mutex для HTTP-запитів.");
+    }
+    asyncServer.begin();
+  }
   void handleClient() {}
   void on(const char *uri, WebRequestMethod method, void (*handler)()) {
     asyncServer.on(uri, method,
       [this, handler](AsyncWebServerRequest *incoming) {
+        if (!lockRequest(incoming)) return;
         request = incoming;
         jsonBody.clear();
         if (incoming->_tempObject) {
@@ -141,6 +151,8 @@ public:
         }
         handler();
         request = nullptr;
+        jsonBody.clear();
+        xSemaphoreGive(requestMutex);
       }, nullptr,
       [](AsyncWebServerRequest *incoming, uint8_t *data, size_t len,
          size_t index, size_t total) {
@@ -151,9 +163,12 @@ public:
   }
   void onNotFound(void (*handler)()) {
     asyncServer.onNotFound([this, handler](AsyncWebServerRequest *incoming) {
+      if (!lockRequest(incoming)) return;
       request = incoming;
       handler();
       request = nullptr;
+      jsonBody.clear();
+      xSemaphoreGive(requestMutex);
     });
   }
   bool authenticate(const char *user, const char *pass) {
@@ -183,6 +198,16 @@ public:
   void sendHeader(const char *, const char *, bool = false) {}
   void send(int statusCode, const char *contentType, const String &body) {
     if (request) request->send(statusCode, contentType, body);
+  }
+
+private:
+  bool lockRequest(AsyncWebServerRequest *incoming) {
+    if (!requestMutex || xSemaphoreTake(requestMutex, portMAX_DELAY) != pdTRUE) {
+      incoming->send(503, "text/plain; charset=utf-8",
+                     "HTTP request handler is temporarily unavailable.");
+      return false;
+    }
+    return true;
   }
 };
 AsyncServerFacade server;
