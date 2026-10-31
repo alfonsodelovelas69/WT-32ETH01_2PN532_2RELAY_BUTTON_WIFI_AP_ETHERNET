@@ -550,15 +550,13 @@ void setCardLastReadEpoch(CardRecord &record, uint32_t epoch) {
 }
 
 bool cardUIDExists(const String &uid) {
-  for (size_t i = 0; i < cardCount; i++) {
-    if (uid == cardRecords[i].uid) return true;
-  }
-  return false;
+  return findCardIndexByUID(uid) >= 0;
 }
 
 int findCardIndexByUID(const String &uid) {
+  String normalizedUID = normalizeUIDInput(uid);
   for (size_t i = 0; i < cardCount; i++) {
-    if (uid == cardRecords[i].uid) return (int)i;
+    if (normalizedUID == cardRecords[i].uid) return (int)i;
   }
   return -1;
 }
@@ -595,9 +593,10 @@ bool isUIDPresent(const String &uid) {
   if (!presenceMutex || xSemaphoreTake(presenceMutex, portMAX_DELAY) != pdTRUE) {
     return false;
   }
+  String normalizedUID = normalizeUIDInput(uid);
   bool present = false;
   for (size_t i = 0; i < presentUIDCount; i++) {
-    if (uid == presentUIDs[i]) {
+    if (normalizedUID == presentUIDs[i]) {
       present = true;
       break;
     }
@@ -612,9 +611,10 @@ bool updateUIDPresence(const String &uid, bool present, bool &changed) {
     return false;
   }
 
+  String normalizedUID = normalizeUIDInput(uid);
   size_t index = presentUIDCount;
   for (size_t i = 0; i < presentUIDCount; i++) {
-    if (uid == presentUIDs[i]) {
+    if (normalizedUID == presentUIDs[i]) {
       index = i;
       break;
     }
@@ -625,7 +625,7 @@ bool updateUIDPresence(const String &uid, bool present, bool &changed) {
       xSemaphoreGive(presenceMutex);
       return false;
     }
-    copyCardField(presentUIDs[presentUIDCount], UID_FIELD_SIZE, uid);
+    copyCardField(presentUIDs[presentUIDCount], UID_FIELD_SIZE, normalizedUID);
     presentUIDCount++;
     changed = true;
   } else if (!present && index < presentUIDCount) {
@@ -1238,18 +1238,18 @@ void trackCardRead(const String &uid) {
   time(&now);
   uint32_t epoch = now >= 1704067200 ? (uint32_t)now : 0;
 
-  for (size_t i = 0; i < cardCount; i++) {
-    if (uid == cardRecords[i].uid) {
-      if (cardRecords[i].readCount < UINT16_MAX) cardRecords[i].readCount++;
-      if (epoch != 0) setCardLastReadEpoch(cardRecords[i], epoch);
-      cardStatsDirty = true;
-      break;
-    }
+  int cardIndex = findCardIndexByUID(uid);
+  if (cardIndex >= 0) {
+    CardRecord &record = cardRecords[cardIndex];
+    if (record.readCount < UINT16_MAX) record.readCount++;
+    if (epoch != 0) setCardLastReadEpoch(record, epoch);
+    cardStatsDirty = true;
   }
 
+  String normalizedUID = normalizeUIDInput(uid);
   size_t existingIndex = recentScanCount;
   for (size_t i = 0; i < recentScanCount; i++) {
-    if (uid == recentScanUIDs[i]) {
+    if (normalizedUID == recentScanUIDs[i]) {
       existingIndex = i;
       break;
     }
@@ -1263,7 +1263,7 @@ void trackCardRead(const String &uid) {
     moveCount--;
   }
   memset(recentScanUIDs[0], 0, RECENT_UID_FIELD_SIZE);
-  copyCardField(recentScanUIDs[0], RECENT_UID_FIELD_SIZE, uid);
+  copyCardField(recentScanUIDs[0], RECENT_UID_FIELD_SIZE, normalizedUID);
 }
 
 void seedRecentScans() {
