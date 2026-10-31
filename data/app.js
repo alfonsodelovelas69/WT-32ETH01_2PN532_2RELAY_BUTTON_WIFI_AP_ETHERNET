@@ -1,5 +1,5 @@
 const $=id=>document.getElementById(id);
-let records=[],presenceRecords=[],selectedPresent=new Set(),selectedRecentUid="",editingIndex=null,clockEpoch=0,clockUpdatedAt=0,ws,durationLoaded=false;
+let records=[],presenceRecords=[],selectedPresent=new Set(),selectedRecentUid="",editingIndex=null,clockEpoch=0,clockUpdatedAt=0,ws,durationLoaded=false,presenceRequestId=0;
 
 async function api(url,options={}){
   const response=await fetch(url,{cache:"no-store",credentials:"same-origin",...options});
@@ -60,11 +60,11 @@ function renderCards(){
   const visible=records.filter(x=>{
     const initials=[x.firstName,x.middleName].map(v=>Array.from(v||"")[0]||"").join("");
     const date=(x.birthDate||"").split("-"),local=date.length===3?`${date[2]}.${date[1]}.${date[0]}`:"";
-    return [x.uid,x.lastName,x.firstName,x.middleName,x.vehicle,x.birthDate,local,initials,(x.lastName||"")+initials].some(v=>normalize(v).includes(query));
+    return [x.uid,x.lastName,x.firstName,x.middleName,x.vehicle,x.birthDate,x.address,x.phone,local,initials,(x.lastName||"")+initials].some(v=>normalize(v).includes(query));
   });
   for(const x of visible){
     const row=document.createElement("tr");
-    for(const value of [x.index,x.uid,x.lastName,x.firstName,x.middleName,x.vehicle,x.birthDate,x.relay]){
+    for(const value of [x.index,x.uid,x.lastName,x.firstName,x.middleName,x.vehicle,x.birthDate,x.address,x.phone,x.relay]){
       const cell=document.createElement("td");cell.textContent=value||"";row.appendChild(cell);
     }
     const actions=document.createElement("td"),edit=document.createElement("button"),remove=document.createElement("button");
@@ -133,11 +133,14 @@ function renderPresence(){
     : `Наразі немає присутніх зареєстрованих карток. Зареєстровано: ${presenceRecords.length}; відсутніх: ${absentCount}; вибрано: ${selected.length} із 10. Стан присутності зберігається лише до перезавантаження пристрою.`;
 }
 async function refreshPresence(){
+  const requestId=++presenceRequestId;
   try{
     const state=await api("/api/presence");
     if(!Array.isArray(state.cards))throw new Error("Сервер повернув некоректний список присутніх");
+    if(requestId!==presenceRequestId)return;
     presenceRecords=state.cards;renderPresence();
   }catch(error){
+    if(requestId!==presenceRequestId)return;
     $("presenceStatus").textContent=error instanceof TypeError
       ?"Немає зв’язку з пристроєм; повторна спроба буде автоматично."
       :`Не вдалося завантажити присутність: ${error.message}`;
@@ -205,7 +208,7 @@ function renderRankings(){
 }
 function startEdit(x){
   editingIndex=x.index;
-  for(const key of ["uid","lastName","firstName","middleName","vehicle","birthDate","relay"])$(key).value=x[key]||"";
+  for(const key of ["uid","lastName","firstName","middleName","vehicle","birthDate","address","phone","relay"])$(key).value=x[key]||"";
   $("uid").readOnly=true;$("cardFormTitle").textContent="Редагувати картку";$("saveCard").textContent="Зберегти зміни";$("cancelEdit").hidden=false;
   $("formStatus").textContent=`Редагування UID ${x.uid}`;window.scrollTo({top:document.body.scrollHeight,behavior:"smooth"});
 }
@@ -214,10 +217,10 @@ function cancelEdit(){
 }
 async function saveCard(){
   const button=$("saveCard"),status=$("formStatus"),data={};
-  for(const key of ["uid","lastName","firstName","middleName","vehicle","birthDate","relay"])data[key]=$(key).value;
+  for(const key of ["uid","lastName","firstName","middleName","vehicle","birthDate","address","phone","relay"])data[key]=$(key).value;
   if(editingIndex!==null)data.index=editingIndex;
   button.disabled=true;status.textContent="Зберігаю...";
-  try{const result=await post(editingIndex===null?"/api/add":"/api/update",data);status.textContent=result.msg||"Збережено";if(editingIndex!==null)cancelEdit();else for(const key of ["uid","lastName","firstName","middleName","vehicle","birthDate"])$(key).value="";await refreshCards();await refreshPresence()}
+  try{const result=await post(editingIndex===null?"/api/add":"/api/update",data);status.textContent=result.msg||"Збережено";if(editingIndex!==null)cancelEdit();else for(const key of ["uid","lastName","firstName","middleName","vehicle","birthDate","address","phone"])$(key).value="";await refreshCards();await refreshPresence()}
   catch(error){status.textContent=`Помилка збереження: ${error.message}`}
   finally{button.disabled=false}
 }

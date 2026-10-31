@@ -60,6 +60,8 @@
 #define NAME_FIELD_SIZE 64
 #define VEHICLE_FIELD_SIZE 24
 #define BIRTH_DATE_FIELD_SIZE 11
+#define ADDRESS_FIELD_SIZE 96
+#define PHONE_FIELD_SIZE 24
 #define ADDR_WIFI_SSID 1000
 #define ADDR_WIFI_PASS 1040
 #define WIFI_MAX_SSID 33 // 32 символи SSID + завершальний нуль
@@ -107,6 +109,8 @@ struct __attribute__((packed)) AttendanceEvent {
 };
 
 CardRecord *cardRecords = nullptr;
+char *cardAddresses[MAX_CARDS] = {};
+char *cardPhones[MAX_CARDS] = {};
 size_t cardCount = 0;
 bool cardStorageReady = false;
 AttendanceEvent attendanceEvents[MAX_ATTENDANCE_EVENTS_PER_TYPE * 2];
@@ -134,10 +138,12 @@ void publishMqttPresenceEvent(const String &uid, bool present,
 bool addRecord(const String &uid, uint8_t relayMask);
 bool addRecord(const String &uid, uint8_t relayMask, const String &lastName,
                const String &firstName, const String &middleName,
-               const String &vehicle, const String &birthDate);
+               const String &vehicle, const String &birthDate,
+               const String &address, const String &phone);
 bool updateCardRecord(size_t index, uint8_t relayMask, const String &lastName,
                       const String &firstName, const String &middleName,
-                      const String &vehicle, const String &birthDate);
+                      const String &vehicle, const String &birthDate,
+                      const String &address, const String &phone);
 bool removeUIDRecord(const String &uid);
 uint8_t findUIDRelayMask(const String &uid);
 String getListJSON();
@@ -254,6 +260,22 @@ bool captiveDnsActive = false;
 const char* webUser = "admin";
 const char* webPass = "ChangeMe123!"; // Змініть на свій пароль
 
+class SemaphoreGuard {
+public:
+  explicit SemaphoreGuard(SemaphoreHandle_t mutex,
+                          TickType_t wait = portMAX_DELAY)
+      : mutex_(mutex), locked_(mutex_ &&
+          xSemaphoreTake(mutex_, wait) == pdTRUE) {}
+  ~SemaphoreGuard() {
+    if (locked_) xSemaphoreGive(mutex_);
+  }
+  bool locked() const { return locked_; }
+
+private:
+  SemaphoreHandle_t mutex_;
+  bool locked_;
+};
+
 // ETH параметри (WT32-ETH01)
 #define ETH_CLK_MODE    ETH_CLOCK_GPIO0_IN
 #define ETH_POWER_PIN   16
@@ -268,11 +290,23 @@ bool nfcPresent = false;
 bool nfc2Present = false;
 int clickDuration = 1000;
 
-// Таймери реле
+struct RelayCommand {
+ uint8_t mask;
+ uint32_t durationMs;
+ uint32_t queuedAt;
+};
+
+QueueHandle_t relayCommandQueue = nullptr;
+portMUX_TYPE relayCommandMux = portMUX_INITIALIZER_UNLOCKED;
+uint8_t pendingRelayStopMask = 0;
+volatile uint32_t relayStatusVersion = 0;
+uint32_t lastPublishedRelayStatusVersion = 0;
+
+// Relay state is owned by relayTask; volatile flags are read for status only.
 unsigned long relay1_turnOffTime = 0;
-bool relay1_active = false;
+volatile bool relay1_active = false;
 unsigned long relay2_turnOffTime = 0;
-bool relay2_active = false;
+volatile bool relay2_active = false;
 
 // NFC debounce
 unsigned long lastNFCRead = 0;
@@ -479,6 +513,22 @@ void copyCardField(char *destination, size_t capacity, const String &value) {
   destination[length] = '\0';
 }
 
+char *duplicateCardField(const String &value) {
+  if (value.length() == 0) return nullptr;
+  char *copy = static_cast<char *>(malloc(value.length() + 1));
+  if (copy) memcpy(copy, value.c_str(), value.length() + 1);
+  return copy;
+}
+
+void clearCardContactFields() {
+  for (size_t i = 0; i < MAX_CARDS; i++) {
+    free(cardAddresses[i]);
+    free(cardPhones[i]);
+    cardAddresses[i] = nullptr;
+    cardPhones[i] = nullptr;
+  }
+}
+
 uint32_t cardLastReadEpoch(const CardRecord &record) {
   uint32_t storedMinutes = (uint32_t)record.lastReadMinutes[0] |
       ((uint32_t)record.lastReadMinutes[1] << 8) |
@@ -608,6 +658,8 @@ String getPresenceJSON() {
     item["middleName"] = record.middleName;
     item["vehicle"] = record.vehicle;
     item["birthDate"] = record.birthDate;
+    item["address"] = cardAddresses[i] ? cardAddresses[i] : "";
+    item["phone"] = cardPhones[i] ? cardPhones[i] : "";
     item["present"] = present;
   }
   doc["total"] = cardCount;
@@ -621,6 +673,7 @@ String getPresenceJSON() {
 bool loadCardFile(const char *path) {
   File file = cardFS.open(path, FILE_READ);
   if (!file) return false;
+  clearCardContactFields();
   cardCount = 0;
   size_t invalidRows = 0;
   while (file.available()) {
@@ -640,7 +693,25 @@ bool loadCardFile(const char *path) {
       continue;
     }
 
-    CardRecord &record = cardRecords[cardCount++];
+    String address = String(doc["address"] | "");
+    String phone = String(doc["phone"] | "");
+    char *addressCopy = duplicateCardField(address);
+    char *phoneCopy = duplicateCardField(phone);
+    if ((address.length() > 0 && !addressCopy) ||
+        (phone.length() > 0 && !phoneCopy)) {
+      free(addressCopy);
+      free(phoneCopy);
+      file.close();
+      clearCardContactFields();
+      cardCount = 0;
+      Serial.println("Недостатньо RAM для завантаження контактних даних карток.");
+      return false;
+    }
+
+    size_t newIndex = cardCount++;
+    cardAddresses[newIndex] = addressCopy;
+    cardPhones[newIndex] = phoneCopy;
+    CardRecord &record = cardRecords[newIndex];
     memset(&record, 0, sizeof(record));
     copyCardField(record.uid, sizeof(record.uid), uid);
     copyCardField(record.lastName, sizeof(record.lastName), String(doc["lastName"] | ""));
@@ -656,6 +727,8 @@ bool loadCardFile(const char *path) {
   if (invalidRows > 0) {
     Serial.print("Некоректних або повторних рядків у файлі карток: ");
     Serial.println(invalidRows);
+    clearCardContactFields();
+    cardCount = 0;
     return false;
   }
   return true;
@@ -680,6 +753,8 @@ bool saveCardRecords() {
     item["middleName"] = cardRecords[i].middleName;
     item["vehicle"] = cardRecords[i].vehicle;
     item["birthDate"] = cardRecords[i].birthDate;
+    item["address"] = cardAddresses[i] ? cardAddresses[i] : "";
+    item["phone"] = cardPhones[i] ? cardPhones[i] : "";
     item["readCount"] = cardRecords[i].readCount;
     item["lastReadEpoch"] = cardLastReadEpoch(cardRecords[i]);
     ok = serializeJson(doc, file) > 0 && file.write('\n') == 1;
@@ -822,21 +897,37 @@ bool initializeCardStorage() {
 }
 
 bool addRecord(const String &uid, uint8_t relayMask) {
-  return addRecord(uid, relayMask, "", "", "", "", "");
+  return addRecord(uid, relayMask, "", "", "", "", "", "", "");
 }
 
 bool addRecord(const String &uid, uint8_t relayMask, const String &lastName,
                const String &firstName, const String &middleName,
-               const String &vehicle, const String &birthDate) {
+               const String &vehicle, const String &birthDate,
+               const String &address, const String &phone) {
   String normalizedUID = normalizeUIDInput(uid);
   if (!cardStorageReady || !isValidUIDFormat(normalizedUID) ||
       relayMask < 1 || relayMask > 3 || cardUIDExists(normalizedUID) ||
       cardCount >= MAX_CARDS || lastName.length() >= NAME_FIELD_SIZE ||
       firstName.length() >= NAME_FIELD_SIZE || middleName.length() >= NAME_FIELD_SIZE ||
       vehicle.length() >= VEHICLE_FIELD_SIZE ||
-      birthDate.length() >= BIRTH_DATE_FIELD_SIZE) return false;
+      birthDate.length() >= BIRTH_DATE_FIELD_SIZE ||
+      address.length() >= ADDRESS_FIELD_SIZE ||
+      phone.length() >= PHONE_FIELD_SIZE) return false;
 
-  CardRecord &record = cardRecords[cardCount++];
+  char *addressCopy = duplicateCardField(address);
+  char *phoneCopy = duplicateCardField(phone);
+  if ((address.length() > 0 && !addressCopy) ||
+      (phone.length() > 0 && !phoneCopy)) {
+    free(addressCopy);
+    free(phoneCopy);
+    Serial.println("Недостатньо RAM для контактних даних нової картки.");
+    return false;
+  }
+
+  size_t newIndex = cardCount++;
+  cardAddresses[newIndex] = addressCopy;
+  cardPhones[newIndex] = phoneCopy;
+  CardRecord &record = cardRecords[newIndex];
   memset(&record, 0, sizeof(record));
   copyCardField(record.uid, sizeof(record.uid), normalizedUID);
   copyCardField(record.lastName, sizeof(record.lastName), lastName);
@@ -847,6 +938,10 @@ bool addRecord(const String &uid, uint8_t relayMask, const String &lastName,
   record.relayMask = relayMask;
   if (saveCardRecords()) return true;
 
+  free(cardAddresses[newIndex]);
+  free(cardPhones[newIndex]);
+  cardAddresses[newIndex] = nullptr;
+  cardPhones[newIndex] = nullptr;
   cardCount--;
   Serial.println("Не вдалося записати список карток у SPIFFS.");
   return false;
@@ -854,13 +949,27 @@ bool addRecord(const String &uid, uint8_t relayMask, const String &lastName,
 
 bool updateCardRecord(size_t index, uint8_t relayMask, const String &lastName,
                       const String &firstName, const String &middleName,
-                      const String &vehicle, const String &birthDate) {
+                      const String &vehicle, const String &birthDate,
+                      const String &address, const String &phone) {
   if (!cardStorageReady || index >= cardCount || relayMask < 1 || relayMask > 3 ||
       lastName.length() >= NAME_FIELD_SIZE ||
       firstName.length() >= NAME_FIELD_SIZE || middleName.length() >= NAME_FIELD_SIZE ||
       vehicle.length() >= VEHICLE_FIELD_SIZE ||
-      birthDate.length() >= BIRTH_DATE_FIELD_SIZE) return false;
+      birthDate.length() >= BIRTH_DATE_FIELD_SIZE ||
+      address.length() >= ADDRESS_FIELD_SIZE ||
+      phone.length() >= PHONE_FIELD_SIZE) return false;
 
+  char *newAddress = duplicateCardField(address);
+  char *newPhone = duplicateCardField(phone);
+  if ((address.length() > 0 && !newAddress) ||
+      (phone.length() > 0 && !newPhone)) {
+    free(newAddress);
+    free(newPhone);
+    Serial.println("Недостатньо RAM для оновлення контактних даних картки.");
+    return false;
+  }
+  char *previousAddress = cardAddresses[index];
+  char *previousPhone = cardPhones[index];
   CardRecord previous = cardRecords[index];
   CardRecord &record = cardRecords[index];
   copyCardField(record.lastName, sizeof(record.lastName), lastName);
@@ -868,10 +977,20 @@ bool updateCardRecord(size_t index, uint8_t relayMask, const String &lastName,
   copyCardField(record.middleName, sizeof(record.middleName), middleName);
   copyCardField(record.vehicle, sizeof(record.vehicle), vehicle);
   copyCardField(record.birthDate, sizeof(record.birthDate), birthDate);
+  cardAddresses[index] = newAddress;
+  cardPhones[index] = newPhone;
   record.relayMask = relayMask;
-  if (saveCardRecords()) return true;
+  if (saveCardRecords()) {
+    free(previousAddress);
+    free(previousPhone);
+    return true;
+  }
 
-  cardRecords[index] = previous;
+  cardAddresses[index] = previousAddress;
+  cardPhones[index] = previousPhone;
+  free(newAddress);
+  free(newPhone);
+  record = previous;
   Serial.println("Не вдалося зберегти зміни картки у SPIFFS.");
   return false;
 }
@@ -879,15 +998,28 @@ bool updateCardRecord(size_t index, uint8_t relayMask, const String &lastName,
 bool removeCardRecord(size_t index) {
   if (!cardStorageReady || index >= cardCount) return false;
   String removedUID = cardRecords[index].uid;
-  for (size_t i = index; i + 1 < cardCount; i++) cardRecords[i] = cardRecords[i + 1];
+  char *removedAddress = cardAddresses[index];
+  char *removedPhone = cardPhones[index];
+  for (size_t i = index; i + 1 < cardCount; i++) {
+    cardRecords[i] = cardRecords[i + 1];
+    cardAddresses[i] = cardAddresses[i + 1];
+    cardPhones[i] = cardPhones[i + 1];
+  }
   cardCount--;
+  memset(&cardRecords[cardCount], 0, sizeof(CardRecord));
+  cardAddresses[cardCount] = nullptr;
+  cardPhones[cardCount] = nullptr;
   if (saveCardRecords()) {
+    free(removedAddress);
+    free(removedPhone);
     bool changed = false;
     if (!updateUIDPresence(removedUID, false, changed)) {
       Serial.println("Не вдалося прибрати видалену картку зі списку присутніх.");
     }
     return true;
   }
+  free(removedAddress);
+  free(removedPhone);
   if (!loadCardFile(CARD_FILE)) {
     cardStorageReady = false;
     Serial.println("Помилка відновлення списку карток після невдалого видалення.");
@@ -920,7 +1052,7 @@ uint8_t findUIDRelayMask(const String &uid) {
 
 String getListJSON() {
   String json;
-  json.reserve(cardCount * 220 + 2);
+  json.reserve(cardCount * 360 + 2);
   json = "[";
   JsonDocument doc;
   for (size_t i = 0; i < cardCount; i++) {
@@ -935,6 +1067,8 @@ String getListJSON() {
     item["middleName"] = cardRecords[i].middleName;
     item["vehicle"] = cardRecords[i].vehicle;
     item["birthDate"] = cardRecords[i].birthDate;
+    item["address"] = cardAddresses[i] ? cardAddresses[i] : "";
+    item["phone"] = cardPhones[i] ? cardPhones[i] : "";
     item["readCount"] = cardRecords[i].readCount;
     item["lastReadEpoch"] = cardLastReadEpoch(cardRecords[i]);
     String recordJson;
@@ -1513,29 +1647,86 @@ String readMqttTopic() {
   return topic.length() ? topic : String("wt32/controller");
 }
 
-void pulseRelays(uint8_t mask, uint32_t durationMs) {
+bool pulseRelays(uint8_t mask, uint32_t durationMs) {
   durationMs = constrain(durationMs, 50UL, 60000UL);
-  unsigned long offAt = millis() + durationMs;
-  if (mask & 0x01) {
-    digitalWrite(RELAY_1, HIGH);
-    relay1_active = true;
-    relay1_turnOffTime = offAt;
+  RelayCommand command = {mask, durationMs, millis()};
+  if (!relayCommandQueue ||
+      xQueueSendToBack(relayCommandQueue, &command, 0) != pdTRUE) {
+    Serial.println("Черга керування реле заповнена; імпульс відхилено.");
+    return false;
   }
-  if (mask & 0x02) {
-    digitalWrite(RELAY_2, HIGH);
-    relay2_active = true;
-    relay2_turnOffTime = offAt;
-  }
+  return true;
 }
 
-void stopRelays(uint8_t mask) {
-  if (mask & 0x01) {
-    digitalWrite(RELAY_1, LOW);
-    relay1_active = false;
-  }
-  if (mask & 0x02) {
-    digitalWrite(RELAY_2, LOW);
-    relay2_active = false;
+bool stopRelays(uint8_t mask) {
+  if (!relayCommandQueue) return false;
+  portENTER_CRITICAL(&relayCommandMux);
+  pendingRelayStopMask |= mask;
+  portEXIT_CRITICAL(&relayCommandMux);
+  return true;
+}
+
+void relayTask(void *) {
+  RelayCommand pending[24];
+  for (;;) {
+    uint32_t now = millis();
+    bool changed = false;
+    if (relay1_active && (int32_t)(now - relay1_turnOffTime) >= 0) {
+      digitalWrite(RELAY_1, LOW);
+      relay1_active = false;
+      changed = true;
+    }
+    if (relay2_active && (int32_t)(now - relay2_turnOffTime) >= 0) {
+      digitalWrite(RELAY_2, LOW);
+      relay2_active = false;
+      changed = true;
+    }
+    if (changed) relayStatusVersion++;
+
+    size_t count = 0;
+    RelayCommand command;
+    while (count < sizeof(pending) / sizeof(pending[0]) &&
+           xQueueReceive(relayCommandQueue, &command, 0) == pdTRUE) {
+      pending[count++] = command;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+      uint32_t offAt = pending[i].queuedAt + pending[i].durationMs;
+      if ((int32_t)(millis() - offAt) >= 0) continue;
+      bool changedState = false;
+      if (pending[i].mask & 0x01) {
+        digitalWrite(RELAY_1, HIGH);
+        changedState |= !relay1_active;
+        relay1_active = true;
+        relay1_turnOffTime = offAt;
+      }
+      if (pending[i].mask & 0x02) {
+        digitalWrite(RELAY_2, HIGH);
+        changedState |= !relay2_active;
+        relay2_active = true;
+        relay2_turnOffTime = offAt;
+      }
+      if (changedState) relayStatusVersion++;
+    }
+
+    uint8_t stopMask;
+    portENTER_CRITICAL(&relayCommandMux);
+    stopMask = pendingRelayStopMask;
+    pendingRelayStopMask = 0;
+    portEXIT_CRITICAL(&relayCommandMux);
+    bool changedState = false;
+    if (stopMask & 0x01) {
+      digitalWrite(RELAY_1, LOW);
+      changedState |= relay1_active;
+      relay1_active = false;
+    }
+    if (stopMask & 0x02) {
+      digitalWrite(RELAY_2, LOW);
+      changedState |= relay2_active;
+      relay2_active = false;
+    }
+    if (changedState) relayStatusVersion++;
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
@@ -1567,6 +1758,7 @@ void publishMqttStatus() {
   lastPublishedNfcPresent = nfcPresent;
   lastPublishedNfc2Present = nfc2Present;
   lastPublishedNet = currentNet;
+  lastPublishedRelayStatusVersion = relayStatusVersion;
   lastMqttStatusPublish = millis();
 }
 
@@ -1711,6 +1903,11 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
 
   String receivedTopic(topic);
   if (receivedTopic == mqttTopic("cmd/presence")) {
+    SemaphoreGuard cardLock(server.requestMutex);
+    if (!cardLock.locked()) {
+      publishMqttCommandResult("presence", false);
+      return;
+    }
     String action = String(doc["action"] | "");
     if (action == "list") {
       String requestId = String(doc["requestId"] | "");
@@ -1760,7 +1957,11 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
       return;
     }
     if (!historySaved) publishMqttCommandResult("presence-history", false);
-    pulseRelays(relayMask, (uint32_t)clickDuration);
+    if (!pulseRelays(relayMask, (uint32_t)clickDuration)) {
+      publishMqttCommandResult("presence-relay", false);
+      publishMqttCommandResult("presence", false);
+      return;
+    }
     publishMqttCard(uid, relayMask, "mqtt");
     publishMqttCommandResult("presence", true);
     publishMqttStatus();
@@ -1774,26 +1975,33 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
       publishMqttCommandResult("relay", false);
       return;
     }
+    bool queued = false;
     if (strcmp(action, "stop") == 0) {
-      stopRelays((uint8_t)mask);
+      queued = stopRelays((uint8_t)mask);
     } else if (strcmp(action, "pulse") == 0) {
       int duration = doc["duration"] | clickDuration;
       if (duration < 50 || duration > 60000) {
         publishMqttCommandResult("relay", false);
         return;
       }
-      pulseRelays((uint8_t)mask, (uint32_t)duration);
+      queued = pulseRelays((uint8_t)mask, (uint32_t)duration);
     } else {
       publishMqttCommandResult("relay", false);
       return;
     }
-    publishMqttCommandResult("relay", true);
+    publishMqttCommandResult("relay", queued);
+    if (!queued) return;
     publishMqttStatus();
     return;
   }
 
   if (receivedTopic == mqttTopic("cmd/card/add") ||
       receivedTopic == mqttTopic("cmd/card/remove")) {
+    SemaphoreGuard cardLock(server.requestMutex);
+    if (!cardLock.locked()) {
+      publishMqttCommandResult("card", false);
+      return;
+    }
     const char *uidValue = doc["uid"] | "";
     String uid = normalizeUIDInput(String(uidValue));
     if (!isValidUIDFormat(uid)) {
@@ -1832,7 +2040,8 @@ void serviceMqtt(unsigned long now) {
     if (now - lastMqttStatusPublish >= MQTT_STATUS_INTERVAL ||
         lastPublishedNfcPresent != nfcPresent ||
         lastPublishedNfc2Present != nfc2Present ||
-        lastPublishedNet != currentNet) {
+        lastPublishedNet != currentNet ||
+        lastPublishedRelayStatusVersion != relayStatusVersion) {
       publishMqttStatus();
     }
     return;
@@ -1873,21 +2082,6 @@ void serviceMqtt(unsigned long now) {
   publishMqttStatus();
 }
 
-void serviceRelays(unsigned long now) {
-  bool changed = false;
-  if (relay1_active && (int32_t)(now - relay1_turnOffTime) >= 0) {
-    stopRelays(0x01);
-    Serial.println("Relay 1 OFF");
-    changed = true;
-  }
-  if (relay2_active && (int32_t)(now - relay2_turnOffTime) >= 0) {
-    stopRelays(0x02);
-    Serial.println("Relay 2 OFF");
-    changed = true;
-  }
-  if (changed) publishMqttStatus();
-}
-
 void startWiFiAP(const char* apSSID, const char* apPass);
 void stopWiFiAP(bool keepStation = false);
 
@@ -1922,6 +2116,11 @@ bool initializePN532SPI() {
 }
 
 void handleScannedCard(const String &uid, uint8_t readerNumber) {
+  SemaphoreGuard cardLock(server.requestMutex);
+  if (!cardLock.locked()) {
+    Serial.println("Не вдалося синхронізувати доступ до списку карток для NFC-зчитування.");
+    return;
+  }
   lastScannedUID = uid;
   Serial.print("PN532 №");
   Serial.print(readerNumber);
@@ -1942,7 +2141,9 @@ void handleScannedCard(const String &uid, uint8_t readerNumber) {
     if (!historySaved) {
       Serial.println("Попередження: журнал події не збережено, але стан RAM оновлено.");
     }
-    pulseRelays(relayMask, (uint32_t)clickDuration);
+    if (!pulseRelays(relayMask, (uint32_t)clickDuration)) {
+      Serial.println("Не вдалося поставити імпульс дозволеної картки у чергу реле.");
+    }
     Serial.print("Дозволена картка, реле: ");
     Serial.println(relayMask);
     if (readerNumber == 2 && !changed) {
@@ -2235,6 +2436,12 @@ void handleListAPI(AsyncWebServerRequest *request) {
     request->requestAuthentication();
     return;
   }
+  SemaphoreGuard cardLock(server.requestMutex);
+  if (!cardLock.locked()) {
+    request->send(503, "application/json",
+                  "{\"ok\":false,\"msg\":\"Пристрій зайнятий; повторіть запит\"}");
+    return;
+  }
   if (!cardStorageReady) {
     Serial.println("API /api/list: сховище карток недоступне.");
     request->send(503, "application/json",
@@ -2391,11 +2598,15 @@ void handleAddAPI() {
   String middleName = server.arg("middleName");
   String vehicle = server.arg("vehicle");
   String birthDate = server.arg("birthDate");
+  String address = server.arg("address");
+  String phone = server.arg("phone");
   if (lastName.length() >= NAME_FIELD_SIZE ||
       firstName.length() >= NAME_FIELD_SIZE ||
       middleName.length() >= NAME_FIELD_SIZE ||
       vehicle.length() >= VEHICLE_FIELD_SIZE ||
-      birthDate.length() >= BIRTH_DATE_FIELD_SIZE) {
+      birthDate.length() >= BIRTH_DATE_FIELD_SIZE ||
+      address.length() >= ADDRESS_FIELD_SIZE ||
+      phone.length() >= PHONE_FIELD_SIZE) {
     sendCardAPIResponse(400, "{\"ok\":false,\"msg\":\"Перевищено допустиму довжину одного з полів\"}");
     return;
   }
@@ -2406,7 +2617,8 @@ void handleAddAPI() {
 
   int r = server.arg("relay").toInt();
   if (r < 1 || r > 3) r = 1;
-  bool ok = addRecord(uid, (uint8_t)r, lastName, firstName, middleName, vehicle, birthDate);
+  bool ok = addRecord(uid, (uint8_t)r, lastName, firstName, middleName,
+                      vehicle, birthDate, address, phone);
   if (ok) {
     Serial.print("API /api/add: картку збережено, всього: ");
     Serial.println(cardCount);
@@ -2442,11 +2654,15 @@ void handleUpdateCardAPI() {
   String middleName = server.arg("middleName");
   String vehicle = server.arg("vehicle");
   String birthDate = server.arg("birthDate");
+  String address = server.arg("address");
+  String phone = server.arg("phone");
   if (lastName.length() >= NAME_FIELD_SIZE ||
       firstName.length() >= NAME_FIELD_SIZE ||
       middleName.length() >= NAME_FIELD_SIZE ||
       vehicle.length() >= VEHICLE_FIELD_SIZE ||
-      birthDate.length() >= BIRTH_DATE_FIELD_SIZE) {
+      birthDate.length() >= BIRTH_DATE_FIELD_SIZE ||
+      address.length() >= ADDRESS_FIELD_SIZE ||
+      phone.length() >= PHONE_FIELD_SIZE) {
     sendCardAPIResponse(400, "{\"ok\":false,\"msg\":\"Перевищено допустиму довжину одного з полів\"}");
     return;
   }
@@ -2461,7 +2677,7 @@ void handleUpdateCardAPI() {
     return;
   }
   if (updateCardRecord((size_t)index, (uint8_t)relay, lastName, firstName,
-                       middleName, vehicle, birthDate)) {
+                       middleName, vehicle, birthDate, address, phone)) {
     Serial.print("API /api/update: картку оновлено, індекс: ");
     Serial.println(index);
     Serial.print("Збережені поля: UID=\""); Serial.print(cardRecords[index].uid);
@@ -2504,8 +2720,11 @@ void handleRelayAPI() {
   }
   String action = server.arg("action");
   if (action == "stop") {
-    stopRelays((uint8_t)mask);
-    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Реле вимкнено\"}");
+    if (!stopRelays((uint8_t)mask)) {
+      server.send(503, "application/json", "{\"ok\":false,\"msg\":\"Черга керування реле заповнена; повторіть команду\"}");
+      return;
+    }
+    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Команду вимкнення поставлено в чергу\"}");
     return;
   }
   if (action != "pulse") {
@@ -2514,9 +2733,15 @@ void handleRelayAPI() {
   }
   int duration = server.arg("duration").toInt();
   if (duration == 0) duration = clickDuration;
-  duration = constrain(duration, 50, 60000);
-  pulseRelays((uint8_t)mask, (uint32_t)duration);
-  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Реле увімкнено на " + String(duration) + " мс\"}");
+  if (duration < 50 || duration > 60000) {
+    server.send(400, "application/json", "{\"ok\":false,\"msg\":\"Тривалість має бути від 50 до 60000 мс\"}");
+    return;
+  }
+  if (!pulseRelays((uint8_t)mask, (uint32_t)duration)) {
+    server.send(503, "application/json", "{\"ok\":false,\"msg\":\"Черга керування реле заповнена; повторіть команду\"}");
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Імпульс реле поставлено в чергу на " + String(duration) + " мс\"}");
 }
 
 void handleSettingsAPI() {
@@ -2936,6 +3161,15 @@ void setup() {
   pinMode(RELAY_2, OUTPUT);
   digitalWrite(RELAY_1, LOW);
   digitalWrite(RELAY_2, LOW);
+  relayCommandQueue = xQueueCreate(24, sizeof(RelayCommand));
+  if (!relayCommandQueue) {
+    Serial.println("Не вдалося створити чергу керування реле; команди реле будуть відхилятися.");
+  } else if (xTaskCreatePinnedToCore(relayTask, "relay-control", 3072, nullptr,
+                                     3, nullptr, 1) != pdPASS) {
+    vQueueDelete(relayCommandQueue);
+    relayCommandQueue = nullptr;
+    Serial.println("Не вдалося запустити окрему задачу таймера реле.");
+  }
 
   // GPIO39 є input-only і не має внутрішнього підтягування. Потрібен 10 кОм до 3.3 V;
   // кнопку підключити між GPIO39 та GND.
@@ -2968,6 +3202,11 @@ void setup() {
     AsyncWebServerRequest *request = static_cast<AsyncWebServerRequest *>(arg);
     if (!request || !request->authenticate(webUser, webPass)) {
       client->close(1008, "Authentication required");
+      return;
+    }
+    SemaphoreGuard cardLock(server.requestMutex);
+    if (!cardLock.locked()) {
+      client->close(1013, "Device is busy");
       return;
     }
     client->text(buildLiveStatusJSON("status"));
@@ -3028,7 +3267,6 @@ void loop() {
 
   unsigned long now = millis();
 
-  serviceRelays(now);
   serviceNetwork(now);
   ensureTimeSync();
   serviceMailNotifications();
@@ -3036,13 +3274,19 @@ void loop() {
   if (now - lastWebSocketBroadcast >= 1000) {
     lastWebSocketBroadcast = now;
     if (webSocket.count() > 0) {
-      webSocket.textAll(buildLiveStatusJSON("status"));
+      SemaphoreGuard cardLock(server.requestMutex);
+      if (cardLock.locked()) {
+        webSocket.textAll(buildLiveStatusJSON("status"));
+      }
     }
     webSocket.cleanupClients();
   }
   if (cardStatsDirty && now - lastCardStatsSave >= CARD_STATS_SAVE_INTERVAL) {
     lastCardStatsSave = now;
-    if (saveCardRecords()) {
+    SemaphoreGuard cardLock(server.requestMutex);
+    if (!cardLock.locked()) {
+      Serial.println("Не вдалося синхронізувати збереження статистики карток.");
+    } else if (saveCardRecords()) {
       cardStatsDirty = false;
     } else {
       Serial.println("Статистика зчитувань залишилася незбереженою; буде повторна спроба.");
@@ -3081,8 +3325,13 @@ void loop() {
     stableButtonState = rawButtonState;
     if (stableButtonState) {
       if (lastScannedUID.length() > 0) {
-        bool ok = addRecord(lastScannedUID, 1);
-        Serial.println(ok ? "Додано через кнопку" : "Не додано через кнопку (дубль/нема місця)");
+        SemaphoreGuard cardLock(server.requestMutex);
+        if (!cardLock.locked()) {
+          Serial.println("Не вдалося синхронізувати додавання картки через кнопку.");
+        } else {
+          bool ok = addRecord(lastScannedUID, 1);
+          Serial.println(ok ? "Додано через кнопку" : "Не додано через кнопку (дубль/нема місця)");
+        }
       } else if (!loggedMissingUID || now - lastMissingUIDMessage >= 10000) {
         Serial.println("Немає останнього UID для додавання");
         lastMissingUIDMessage = now;
