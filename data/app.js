@@ -77,7 +77,6 @@ function renderCards(){
     ? `${$("cards").closest("table").tHead.offsetHeight+rows.slice(0,10).reduce((height,row)=>height+row.offsetHeight,0)}px`
     :"";
   $("cardListStatus").textContent=`Показано ${visible.length} із ${records.length} карток`;
-  renderRankings();
 }
 async function refreshCards(){
   try{records=await api("/api/list");if(!Array.isArray(records))throw new Error("Сервер повернув не список");renderCards()}
@@ -188,23 +187,6 @@ function fillEvents(id,items){
     entry.append(plate,details);list.appendChild(entry);
   }
   if(!items.length){const li=document.createElement("li");li.className="activityHistoryEmpty";li.textContent="Записів поки немає";list.appendChild(li)}
-}
-function renderRankings(){
-  const oldest=records.slice().sort((a,b)=>Number(a.lastReadEpoch||0)-Number(b.lastReadEpoch||0));
-  const frequent=records.filter(x=>Number(x.readCount)>0).sort((a,b)=>Number(b.readCount)-Number(a.readCount)||Number(b.lastReadEpoch||0)-Number(a.lastReadEpoch||0));
-  for(const [id,items,byCount] of [["oldestReads",oldest,false],["frequentReads",frequent,true]]){
-    const list=$(id);list.replaceChildren();list.className="activityHistory";
-    items.slice(0,10).forEach((item,index)=>{
-      const entry=document.createElement("li"),plate=document.createElement("strong"),details=document.createElement("span"),region=detectPlateRegion(item.vehicle);
-      entry.className="activityHistoryEntry";
-      plate.className="activityHistoryPlate";
-      if(region)plate.dataset.region=region.code;
-      else plate.classList.add("activityPlateNoRegion");
-      plate.textContent=item.vehicle||item.uid;
-      details.textContent=`№${index+1} — ${item.uid} — ${byCount?`зчитувань: ${item.readCount}`:Number(item.readCount)===0?"ніколи не зчитувалась":dateText(item.lastReadEpoch)}`;
-      entry.append(plate,details);list.appendChild(entry);
-    });
-  }
 }
 function startEdit(x){
   editingIndex=x.index;

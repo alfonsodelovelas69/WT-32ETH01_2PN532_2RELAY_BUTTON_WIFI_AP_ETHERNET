@@ -293,7 +293,7 @@ int clickDuration = 1000;
 struct RelayCommand {
  uint8_t mask;
  uint32_t durationMs;
- uint32_t queuedAt;
+ bool holdOn;
 };
 
 QueueHandle_t relayCommandQueue = nullptr;
@@ -305,8 +305,10 @@ uint32_t lastPublishedRelayStatusVersion = 0;
 // Relay state is owned by relayTask; volatile flags are read for status only.
 unsigned long relay1_turnOffTime = 0;
 volatile bool relay1_active = false;
+bool relay1_timed = false;
 unsigned long relay2_turnOffTime = 0;
 volatile bool relay2_active = false;
+bool relay2_timed = false;
 
 // NFC debounce
 unsigned long lastNFCRead = 0;
@@ -342,6 +344,8 @@ bool lastPublishedNfcPresent = false;
 bool lastPublishedNfc2Present = false;
 bool wifiConnectPending = false;
 unsigned long wifiConnectPendingAt = 0;
+uint8_t wifiConnectAttempts = 0;
+unsigned long nextWiFiRetryAt = 0;
 bool wifiScanInProgress = false;
 String wifiScanResultJson;
 
@@ -1342,7 +1346,9 @@ String getActivityJSON() {
 
 // -------------------- WiFi / ETH фолбек --------------------
 const unsigned long ETH_WAIT_MS = 8000;
-const unsigned long WIFI_STA_TIMEOUT = 5000;
+const unsigned long WIFI_STA_TIMEOUT = 20000;
+const unsigned long WIFI_RETRY_INTERVAL = 60000;
+const uint8_t WIFI_MAX_ATTEMPTS = 3;
 const IPAddress AP_IP(192, 168, 4, 1);
 const IPAddress AP_GATEWAY(192, 168, 4, 1);
 const IPAddress AP_SUBNET(255, 255, 255, 0);
@@ -1385,6 +1391,24 @@ bool writeWiFiCreds(const String &ssid, const String &pass) {
   if (!EEPROM.commit()) return false;
   return isWiFiFallbackConfigured() && readWiFiSSID() == ssid &&
          readWiFiPass() == pass;
+}
+
+void beginWiFiConnection(const String &ssid, const String &pass,
+                         unsigned long now) {
+  WiFi.mode(apActive ? WIFI_AP_STA : WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(false);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  wifiConnectAttempts++;
+  networkPhaseStarted = now;
+  networkStartup = NET_START_WIFI;
+  currentNet = apActive ? NET_WIFI_AP : NET_NONE;
+  Serial.print("Підключаюся до WiFi SSID (спроба ");
+  Serial.print(wifiConnectAttempts);
+  Serial.print("/");
+  Serial.print(WIFI_MAX_ATTEMPTS);
+  Serial.print("): ");
+  Serial.println(ssid);
 }
 
 static const char GTS_ROOT_R1[] =
@@ -1649,10 +1673,20 @@ String readMqttTopic() {
 
 bool pulseRelays(uint8_t mask, uint32_t durationMs) {
   durationMs = constrain(durationMs, 50UL, 60000UL);
-  RelayCommand command = {mask, durationMs, millis()};
+  RelayCommand command = {mask, durationMs, false};
   if (!relayCommandQueue ||
       xQueueSendToBack(relayCommandQueue, &command, 0) != pdTRUE) {
     Serial.println("Черга керування реле заповнена; імпульс відхилено.");
+    return false;
+  }
+  return true;
+}
+
+bool turnRelaysOn(uint8_t mask) {
+  RelayCommand command = {mask, 0, true};
+  if (!relayCommandQueue ||
+      xQueueSendToBack(relayCommandQueue, &command, 0) != pdTRUE) {
+    Serial.println("Черга керування реле заповнена; постійне ввімкнення відхилено.");
     return false;
   }
   return true;
@@ -1671,14 +1705,20 @@ void relayTask(void *) {
   for (;;) {
     uint32_t now = millis();
     bool changed = false;
-    if (relay1_active && (int32_t)(now - relay1_turnOffTime) >= 0) {
+    if (relay1_active && relay1_timed &&
+        (int32_t)(now - relay1_turnOffTime) >= 0) {
       digitalWrite(RELAY_1, LOW);
       relay1_active = false;
+      relay1_timed = false;
+      relay1_turnOffTime = 0;
       changed = true;
     }
-    if (relay2_active && (int32_t)(now - relay2_turnOffTime) >= 0) {
+    if (relay2_active && relay2_timed &&
+        (int32_t)(now - relay2_turnOffTime) >= 0) {
       digitalWrite(RELAY_2, LOW);
       relay2_active = false;
+      relay2_timed = false;
+      relay2_turnOffTime = 0;
       changed = true;
     }
     if (changed) relayStatusVersion++;
@@ -1690,40 +1730,49 @@ void relayTask(void *) {
       pending[count++] = command;
     }
 
-    for (size_t i = 0; i < count; i++) {
-      uint32_t offAt = pending[i].queuedAt + pending[i].durationMs;
-      if ((int32_t)(millis() - offAt) >= 0) continue;
-      bool changedState = false;
-      if (pending[i].mask & 0x01) {
-        digitalWrite(RELAY_1, HIGH);
-        changedState |= !relay1_active;
-        relay1_active = true;
-        relay1_turnOffTime = offAt;
-      }
-      if (pending[i].mask & 0x02) {
-        digitalWrite(RELAY_2, HIGH);
-        changedState |= !relay2_active;
-        relay2_active = true;
-        relay2_turnOffTime = offAt;
-      }
-      if (changedState) relayStatusVersion++;
-    }
-
     uint8_t stopMask;
     portENTER_CRITICAL(&relayCommandMux);
     stopMask = pendingRelayStopMask;
     pendingRelayStopMask = 0;
     portEXIT_CRITICAL(&relayCommandMux);
+
+    for (size_t i = 0; i < count; i++) {
+      uint8_t commandMask = pending[i].mask & (uint8_t)~stopMask;
+      if (!commandMask) continue;
+      uint32_t offAt = pending[i].holdOn
+          ? 0 : millis() + pending[i].durationMs;
+      bool changedState = false;
+      if (commandMask & 0x01) {
+        digitalWrite(RELAY_1, HIGH);
+        changedState |= !relay1_active;
+        relay1_active = true;
+        relay1_timed = !pending[i].holdOn;
+        relay1_turnOffTime = relay1_timed ? offAt : 0;
+      }
+      if (commandMask & 0x02) {
+        digitalWrite(RELAY_2, HIGH);
+        changedState |= !relay2_active;
+        relay2_active = true;
+        relay2_timed = !pending[i].holdOn;
+        relay2_turnOffTime = relay2_timed ? offAt : 0;
+      }
+      if (changedState) relayStatusVersion++;
+    }
+
     bool changedState = false;
     if (stopMask & 0x01) {
       digitalWrite(RELAY_1, LOW);
       changedState |= relay1_active;
       relay1_active = false;
+      relay1_timed = false;
+      relay1_turnOffTime = 0;
     }
     if (stopMask & 0x02) {
       digitalWrite(RELAY_2, LOW);
       changedState |= relay2_active;
       relay2_active = false;
+      relay2_timed = false;
+      relay2_turnOffTime = 0;
     }
     if (changedState) relayStatusVersion++;
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -1775,6 +1824,30 @@ void publishMqttCard(const String &uid, uint8_t relayMask, const char *reader) {
   if (length == 0 || !mqttClient.publish(mqttTopic("event/card").c_str(), payload)) {
     Serial.println("Не вдалося опублікувати MQTT card event.");
   }
+}
+
+bool publishMqttLatestCard(const String &requestId) {
+  if (!mqttClient.connected()) return false;
+
+  JsonDocument doc;
+  bool found = lastScannedUID.length() > 0;
+  doc["found"] = found;
+  doc["uid"] = lastScannedUID;
+  if (requestId.length()) doc["requestId"] = requestId;
+
+  int cardIndex = found ? findCardIndexByUID(lastScannedUID) : -1;
+  doc["authorized"] = cardIndex >= 0;
+  doc["relay"] = cardIndex >= 0 ? cardRecords[cardIndex].relayMask : 0;
+  if (cardIndex >= 0) doc["vehicle"] = cardRecords[cardIndex].vehicle;
+
+  String payload;
+  serializeJson(doc, payload);
+  if (!mqttClient.publish(mqttTopic("data/card/latest").c_str(),
+                          payload.c_str())) {
+    Serial.println("Не вдалося опублікувати MQTT останню зчитану картку.");
+    return false;
+  }
+  return true;
 }
 
 void publishMqttPresenceEvent(const String &uid, bool present,
@@ -1902,6 +1975,19 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
   }
 
   String receivedTopic(topic);
+  if (receivedTopic == mqttTopic("cmd/card/latest")) {
+    SemaphoreGuard cardLock(server.requestMutex);
+    if (!cardLock.locked()) {
+      publishMqttCommandResult("latest-card", false);
+      return;
+    }
+    String requestId = String(doc["requestId"] | "");
+    if (requestId.length() > 32) requestId.remove(32);
+    publishMqttCommandResult("latest-card",
+                             publishMqttLatestCard(requestId));
+    return;
+  }
+
   if (receivedTopic == mqttTopic("cmd/presence")) {
     SemaphoreGuard cardLock(server.requestMutex);
     if (!cardLock.locked()) {
@@ -1976,8 +2062,10 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
       return;
     }
     bool queued = false;
-    if (strcmp(action, "stop") == 0) {
+    if (strcmp(action, "stop") == 0 || strcmp(action, "off") == 0) {
       queued = stopRelays((uint8_t)mask);
+    } else if (strcmp(action, "on") == 0) {
+      queued = turnRelaysOn((uint8_t)mask);
     } else if (strcmp(action, "pulse") == 0) {
       int duration = doc["duration"] | clickDuration;
       if (duration < 50 || duration > 60000) {
@@ -2077,8 +2165,13 @@ void serviceMqtt(unsigned long now) {
       mqttClient.subscribe(mqttTopic("cmd/relay").c_str()) &&
       mqttClient.subscribe(mqttTopic("cmd/card/add").c_str()) &&
       mqttClient.subscribe(mqttTopic("cmd/card/remove").c_str()) &&
+      mqttClient.subscribe(mqttTopic("cmd/card/latest").c_str()) &&
       mqttClient.subscribe(mqttTopic("cmd/presence").c_str());
-  if (!subscriptionsOk) Serial.println("Не вдалося оформити всі MQTT-підписки.");
+  if (!subscriptionsOk) {
+    Serial.println("Не вдалося оформити всі MQTT-підписки; повторю підключення.");
+    mqttClient.disconnect();
+    return;
+  }
   publishMqttStatus();
 }
 
@@ -2189,6 +2282,8 @@ void serviceNetwork(unsigned long now) {
   IPAddress ethIP = ETH.localIP();
   if (ETH.linkUp() && hasIP(ethIP)) {
     wifiConnectPending = false;
+    wifiConnectAttempts = 0;
+    nextWiFiRetryAt = 0;
     if (apActive) stopWiFiAP();
     else if (currentNet != NET_ETH && WiFi.getMode() != WIFI_OFF) {
       WiFi.disconnect(true);
@@ -2206,35 +2301,28 @@ void serviceNetwork(unsigned long now) {
 
   if (wifiConnectPending && (int32_t)(now - wifiConnectPendingAt) >= 0) {
     wifiConnectPending = false;
-    WiFi.mode(apActive ? WIFI_AP_STA : WIFI_STA);
-    WiFi.setSleep(false);
     String ssid = readWiFiSSID();
     String pass = readWiFiPass();
-    currentNet = apActive ? NET_WIFI_AP : NET_NONE;
-    Serial.print("Підключаюся до WiFi SSID: ");
-    Serial.println(ssid);
-    WiFi.begin(ssid.c_str(), pass.c_str());
-    networkPhaseStarted = now;
-    networkStartup = NET_START_WIFI;
+    wifiConnectAttempts = 0;
+    nextWiFiRetryAt = 0;
+    beginWiFiConnection(ssid, pass, now);
     return;
   }
 
   if (currentNet == NET_ETH) {
-    if (WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED && hasIP(WiFi.localIP())) {
       currentNet = NET_WIFI_STA;
+      wifiConnectAttempts = 0;
       Serial.print("Перемикаюсь на WiFi, IP: "); Serial.println(WiFi.localIP());
       return;
     }
     String ssid = readWiFiSSID();
     if (isWiFiFallbackConfigured() && ssid.length() > 0) {
       Serial.println("Ethernet втрачено; пробую збережену WiFi-мережу.");
-      WiFi.mode(WIFI_STA);
-      WiFi.setSleep(false);
       String pass = readWiFiPass();
-      WiFi.begin(ssid.c_str(), pass.c_str());
-      networkPhaseStarted = now;
-      networkStartup = NET_START_WIFI;
-      currentNet = NET_NONE;
+      wifiConnectAttempts = 0;
+      nextWiFiRetryAt = 0;
+      beginWiFiConnection(ssid, pass, now);
       return;
     }
     Serial.println("Ethernet втрачено, WiFi не налаштований; запускаю AP.");
@@ -2242,9 +2330,12 @@ void serviceNetwork(unsigned long now) {
     networkStartup = NET_START_DONE;
     return;
   }
-  if (currentNet == NET_WIFI_STA && WiFi.status() != WL_CONNECTED) {
+  if (currentNet == NET_WIFI_STA &&
+      (WiFi.status() != WL_CONNECTED || !hasIP(WiFi.localIP()))) {
     Serial.println("Мережа втрачена; запускаю локальну точку доступу.");
     startWiFiAP("WT32-Config", "config1234");
+    wifiConnectAttempts = 0;
+    nextWiFiRetryAt = now + WIFI_RETRY_INTERVAL;
     networkStartup = NET_START_DONE;
     return;
   }
@@ -2261,27 +2352,34 @@ void serviceNetwork(unsigned long now) {
       return;
     }
 
-    Serial.print("Пробую WiFi SSID: "); Serial.println(ssid);
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
     String pass = readWiFiPass();
-    WiFi.begin(ssid.c_str(), pass.c_str());
-    networkPhaseStarted = now;
-    networkStartup = NET_START_WIFI;
+    wifiConnectAttempts = 0;
+    nextWiFiRetryAt = 0;
+    beginWiFiConnection(ssid, pass, now);
     return;
   }
 
   if (networkStartup == NET_START_WIFI) {
-    if (WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED && hasIP(WiFi.localIP())) {
       if (apActive) stopWiFiAP(true);
       currentNet = NET_WIFI_STA;
       networkStartup = NET_START_DONE;
+      wifiConnectAttempts = 0;
+      nextWiFiRetryAt = 0;
       Serial.print("WiFi підключено, IP: "); Serial.println(WiFi.localIP());
       Serial.print("Вебсторінка: http://"); Serial.println(WiFi.localIP());
       return;
     }
     if (now - networkPhaseStarted >= WIFI_STA_TIMEOUT) {
-      Serial.println("WiFi не підключився; запускаю AP.");
+      Serial.print("WiFi не підключився за ");
+      Serial.print(WIFI_STA_TIMEOUT / 1000);
+      Serial.println(" с.");
+      if (wifiConnectAttempts < WIFI_MAX_ATTEMPTS) {
+        beginWiFiConnection(readWiFiSSID(), readWiFiPass(), now);
+        return;
+      }
+
+      Serial.println("Вичерпано спроби WiFi; запускаю або залишаю AP.");
       if (apActive) {
         WiFi.disconnect(false);
         WiFi.mode(WIFI_AP);
@@ -2290,8 +2388,19 @@ void serviceNetwork(unsigned long now) {
         WiFi.disconnect(true);
         startWiFiAP("WT32-Config", "config1234");
       }
+      wifiConnectAttempts = 0;
+      nextWiFiRetryAt = now + WIFI_RETRY_INTERVAL;
       networkStartup = NET_START_DONE;
+      return;
     }
+  }
+
+  if (networkStartup == NET_START_DONE && currentNet == NET_WIFI_AP &&
+      apActive && isWiFiFallbackConfigured() &&
+      nextWiFiRetryAt != 0 &&
+      (int32_t)(now - nextWiFiRetryAt) >= 0) {
+    wifiConnectAttempts = 0;
+    beginWiFiConnection(readWiFiSSID(), readWiFiPass(), now);
   }
 }
 
@@ -2378,15 +2487,14 @@ void handleRootLegacy() {
   html += "<script>const cardSaveFrame=document.createElement('iframe');cardSaveFrame.name='cardSaveFrame';cardSaveFrame.title='Відповідь сервера карток';cardSaveFrame.hidden=true;let cardSaveFrameReady=false,cardSavePending=false;cardSaveFrame.addEventListener('load',async()=>{if(!cardSaveFrameReady){cardSaveFrameReady=true;return}if(!cardSavePending)return;cardSavePending=false;const button=document.getElementById('addCardButton'),status=document.getElementById('uidAddStatus');try{const text=cardSaveFrame.contentDocument.body.textContent.trim(),result=JSON.parse(text);status.textContent=result.msg||'Сервер відповів без повідомлення';if(result.ok){for(const name of cardSaveFields.slice(0,6))document.getElementById(name).value='';if(editingCardIndex!==null){editingCardIndex=null;document.getElementById('uid').readOnly=false;button.textContent='Додати картку';const cancel=document.getElementById('cancelEditButton');if(cancel)cancel.remove()}await refresh()}}catch(error){status.textContent='Не вдалося прочитати відповідь WT32. Перевірте список карток перед повтором.';console.error('Помилка відповіді форми збереження:',error)}finally{button.disabled=false}});cardSaveFrame.src='about:blank';document.body.appendChild(cardSaveFrame);const cardSaveForm=document.createElement('form');cardSaveForm.method='POST';cardSaveForm.target=cardSaveFrame.name;cardSaveForm.hidden=true;const cardSaveFields=['uid','lastName','firstName','middleName','vehicle','birthDate','relay','index'];const cardSaveInputs={};for(const name of cardSaveFields){const input=document.createElement('input');input.type='hidden';input.name=name;cardSaveForm.appendChild(input);cardSaveInputs[name]=input}document.body.appendChild(cardSaveForm);window.saveCardRecord=function(){if(cardSavePending)return;const button=document.getElementById('addCardButton'),status=document.getElementById('uidAddStatus'),editing=editingCardIndex!==null;for(const name of cardSaveFields)cardSaveInputs[name].value=name==='index'?(editing?String(editingCardIndex):''):document.getElementById(name).value;cardSaveForm.action=editing?'/api/update':'/api/add';cardSavePending=true;button.disabled=true;status.textContent=editing?'Надсилаю зміни на WT32...':'Надсилаю картку на WT32...';cardSaveForm.submit()};window.add=window.saveCardRecord;saveCardButton.onclick=event=>{event.preventDefault();window.saveCardRecord()};</script>";
   html += "<script>const nativeCardSaveSubmit=cardSaveForm.submit.bind(cardSaveForm);cardSaveForm.submit=function(){if(!cardSaveFrameReady){cardSavePending=false;const button=document.getElementById('addCardButton');button.disabled=false;document.getElementById('uidAddStatus').textContent='Зачекайте, поки підготується з’єднання з пристроєм, і повторіть спробу.';return}this.action+=(this.action.includes('?')?'&':'?')+'iframe=1';nativeCardSaveSubmit()};</script>";
   html += "<script>let searchLogTimer;const renderCardsForSearchLog=renderCards;renderCards=function(){renderCardsForSearchLog();clearTimeout(searchLogTimer);const query=document.getElementById('cardSearch').value,matches=document.querySelectorAll('#list tr').length;searchLogTimer=setTimeout(async()=>{try{const response=await apiRequest('/api/search-log',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({query,matches})}),result=await responseMessage(response);if(!response.ok)throw new Error(result.msg||'HTTP '+response.status);console.info('Відповідь пошуку WT32:',result.matches,'збігів для',JSON.stringify(result.query))}catch(error){console.error('Не вдалося надіслати пошук до WT32:',error)}},350)};</script>";
-  html += "<section class='card'><h3>Останні зчитування та облік</h3><p>Час Києва: <strong id='kyivClock'>очікується синхронізація з NTP</strong></p><label for='recentUidSelect'>Останні 10 зчитаних UID / номерів авто:</label><select id='recentUidSelect' style='width:100%'><option value=''>Поки немає зчитувань</option></select><div class='row'><button type='button' id='markArrivedButton'>Позначити «Прибув»</button><button type='button' id='markDepartedButton'>Позначити «Вибув»</button></div><p id='attendanceStatus' role='status'></p><label><input id='showOldestReads' type='checkbox'> Показати 10 карток, які найдовше не зчитувалися</label><ol id='oldestReadsList' hidden></ol><label><input id='showFrequentReads' type='checkbox'> Показати 10 найчастіше зчитаних UID</label><ol id='frequentReadsList' hidden></ol><div class='row'><div style='flex:1;min-width:240px'><h4>Прибули (останні 10)</h4><ol id='arrivalsList'></ol></div><div style='flex:1;min-width:240px'><h4>Вибули (останні 10)</h4><ol id='departuresList'></ol></div></div></section>";
+  html += "<section class='card'><h3>Останні зчитування та облік</h3><p>Час Києва: <strong id='kyivClock'>очікується синхронізація з NTP</strong></p><label for='recentUidSelect'>Останні 10 зчитаних UID / номерів авто:</label><select id='recentUidSelect' style='width:100%'><option value=''>Поки немає зчитувань</option></select><div class='row'><button type='button' id='markArrivedButton'>Позначити «Прибув»</button><button type='button' id='markDepartedButton'>Позначити «Вибув»</button></div><p id='attendanceStatus' role='status'></p><div class='row'><div style='flex:1;min-width:240px'><h4>Прибули (останні 10)</h4><ol id='arrivalsList'></ol></div><div style='flex:1;min-width:240px'><h4>Вибули (останні 10)</h4><ol id='departuresList'></ol></div></div></section>";
   html += "<script>let cardListRefreshRunning=false,serverClockEpoch=0,serverClockReceivedAt=0;";
   html += "function displayActivityRows(elementId,items){let list=document.getElementById(elementId);list.replaceChildren();if(!items.length){let row=document.createElement('li');row.textContent='Записів поки немає';list.appendChild(row);return}for(const item of items){let row=document.createElement('li'),name=[item.vehicle,item.uid].filter(Boolean).join(' — '),when=item.epoch?new Date(item.epoch*1000).toLocaleString('uk-UA',{timeZone:'Europe/Kyiv'}):'час не синхронізовано';row.textContent=name+' ('+when+')';list.appendChild(row)}}";
-  html += "async function refreshActivity(){let response=await apiRequest('/api/activity');if(!response.ok)throw new Error('HTTP '+response.status);let activity=await response.json(),select=document.getElementById('recentUidSelect'),selected=select.value;select.replaceChildren();if(!activity.recent.length){let option=document.createElement('option');option.value='';option.textContent='Поки немає зчитувань';select.appendChild(option)}else{for(const item of activity.recent){let option=document.createElement('option');option.value=item.uid;option.textContent=[item.vehicle,item.uid,item.lastName].filter(Boolean).join(' — ');select.appendChild(option)}if(activity.recent.some(item=>item.uid===selected))select.value=selected}serverClockEpoch=activity.epoch||0;serverClockReceivedAt=Date.now();displayActivityRows('arrivalsList',activity.arrivals);displayActivityRows('departuresList',activity.departures);renderReadRankings()}";
-  html += "function renderReadRankings(){let oldest=cardData.slice().sort((a,b)=>Number(a.lastReadEpoch||0)-Number(b.lastReadEpoch||0)),frequent=cardData.filter(item=>Number(item.readCount)>0).sort((a,b)=>Number(b.readCount)-Number(a.readCount)||Number(b.lastReadEpoch||0)-Number(a.lastReadEpoch||0));function fill(id,items,withCount){let list=document.getElementById(id);list.replaceChildren();for(const item of items.slice(0,10)){let row=document.createElement('li'),when=Number(item.readCount)===0?'ніколи не зчитувалась':item.lastReadEpoch?new Date(item.lastReadEpoch*1000).toLocaleString('uk-UA',{timeZone:'Europe/Kyiv'}):'час не синхронізовано';row.textContent=[item.vehicle,item.uid].filter(Boolean).join(' — ')+(withCount?' — зчитувань: '+item.readCount:' — останнє зчитування: '+when);list.appendChild(row)}if(!items.length){let row=document.createElement('li');row.textContent='Статистика зчитувань ще відсутня';list.appendChild(row)}}fill('oldestReadsList',oldest,false);fill('frequentReadsList',frequent,true)}";
+  html += "async function refreshActivity(){let response=await apiRequest('/api/activity');if(!response.ok)throw new Error('HTTP '+response.status);let activity=await response.json(),select=document.getElementById('recentUidSelect'),selected=select.value;select.replaceChildren();if(!activity.recent.length){let option=document.createElement('option');option.value='';option.textContent='Поки немає зчитувань';select.appendChild(option)}else{for(const item of activity.recent){let option=document.createElement('option');option.value=item.uid;option.textContent=[item.vehicle,item.uid,item.lastName].filter(Boolean).join(' — ');select.appendChild(option)}if(activity.recent.some(item=>item.uid===selected))select.value=selected}serverClockEpoch=activity.epoch||0;serverClockReceivedAt=Date.now();displayActivityRows('arrivalsList',activity.arrivals);displayActivityRows('departuresList',activity.departures)}";
   html += "async function recordAttendance(action){let button=action==='arrive'?document.getElementById('markArrivedButton'):document.getElementById('markDepartedButton'),status=document.getElementById('attendanceStatus'),uid=document.getElementById('recentUidSelect').value;if(!uid){status.textContent='Спочатку зчитайте UID.';return}button.disabled=true;try{let response=await apiRequest('/api/attendance',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({uid:uid,action:action})}),result=await responseMessage(response);status.textContent=result.msg||'Подію записано';if(response.ok&&result.ok)await refreshActivity()}catch(error){status.textContent='Не вдалося записати подію: '+error.message}finally{button.disabled=false}}";
   html += "function updateKyivClock(){let clock=document.getElementById('kyivClock');if(!serverClockEpoch){clock.textContent='очікується синхронізація з NTP';return}let epoch=serverClockEpoch+Math.floor((Date.now()-serverClockReceivedAt)/1000);clock.textContent=new Date(epoch*1000).toLocaleString('uk-UA',{timeZone:'Europe/Kyiv'})}";
-  html += "document.getElementById('showOldestReads').onchange=event=>document.getElementById('oldestReadsList').hidden=!event.target.checked;document.getElementById('showFrequentReads').onchange=event=>document.getElementById('frequentReadsList').hidden=!event.target.checked;document.getElementById('markArrivedButton').onclick=()=>recordAttendance('arrive');document.getElementById('markDepartedButton').onclick=()=>recordAttendance('depart');";
-  html += "window.refresh=async function(){if(cardListRefreshRunning)return;cardListRefreshRunning=true;let status=document.getElementById('cardListStatus');try{let response=await apiRequest('/api/list'),body=await response.text(),records;try{records=JSON.parse(body)}catch(error){throw new Error('сервер повернув некоректну відповідь (HTTP '+response.status+')')}if(!response.ok)throw new Error(records.msg||'HTTP '+response.status);if(!Array.isArray(records))throw new Error('сервер повернув не список карток');cardData=records;renderCards();renderReadRankings()}catch(error){let message=error.name==='AbortError'?'час очікування відповіді вичерпано':error.message;status.textContent='Не вдалося завантажити список: '+message;console.error('Помилка завантаження списку карток:',error)}finally{cardListRefreshRunning=false}};";
+  html += "document.getElementById('markArrivedButton').onclick=()=>recordAttendance('arrive');document.getElementById('markDepartedButton').onclick=()=>recordAttendance('depart');";
+  html += "window.refresh=async function(){if(cardListRefreshRunning)return;cardListRefreshRunning=true;let status=document.getElementById('cardListStatus');try{let response=await apiRequest('/api/list'),body=await response.text(),records;try{records=JSON.parse(body)}catch(error){throw new Error('сервер повернув некоректну відповідь (HTTP '+response.status+')')}if(!response.ok)throw new Error(records.msg||'HTTP '+response.status);if(!Array.isArray(records))throw new Error('сервер повернув не список карток');cardData=records;renderCards()}catch(error){let message=error.name==='AbortError'?'час очікування відповіді вичерпано':error.message;status.textContent='Не вдалося завантажити список: '+message;console.error('Помилка завантаження списку карток:',error)}finally{cardListRefreshRunning=false}};";
   html += "window.onload=()=>{window.refresh();refreshStatus().catch(error=>console.error('Не вдалося оновити стан пристрою:',error));refreshActivity().catch(error=>{document.getElementById('attendanceStatus').textContent='Не вдалося завантажити історію: '+error.message});setInterval(()=>window.refresh(),10000);setInterval(()=>refreshStatus().catch(error=>console.error('Не вдалося оновити стан пристрою:',error)),5000);setInterval(()=>refreshActivity().catch(error=>console.error('Не вдалося оновити активність:',error)),15000);setInterval(updateKyivClock,1000)};</script>";
   html += "<section class='card'><h3>Мережа</h3><p><a href='/wifi' onclick='openWifi(event)'>Налаштувати WiFi для резервного підключення</a></p><p><a href='/mqtt'>Налаштувати MQTT-брокер</a></p><p>Якщо роутер недоступний, підключіться до WT32-Config і відкрийте 192.168.4.1.</p></section></body></html>";
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
@@ -2958,7 +3066,15 @@ void handleMqttSettings() {
     eepromWriteString(ADDR_MQTT_USER, user, MQTT_MAX_USER);
     eepromWriteString(ADDR_MQTT_PASS, pass, MQTT_MAX_PASS);
     eepromWriteString(ADDR_MQTT_TOPIC, topic, MQTT_MAX_TOPIC);
-    EEPROM.commit();
+    bool saved = EEPROM.commit() && readMqttHost() == host &&
+                 readMqttPort() == (uint16_t)portValue &&
+                 readMqttUser() == user && readMqttPass() == pass &&
+                 readMqttTopic() == topic;
+    if (!saved) {
+      server.send(500, "application/json",
+          "{\"ok\":false,\"msg\":\"Не вдалося надійно зберегти MQTT-налаштування в EEPROM\"}");
+      return;
+    }
     mqttClient.disconnect();
     server.send(200, "application/json", "{\"ok\":true,\"msg\":\"MQTT налаштування збережено. Підключення буде повторено автоматично.\"}");
     return;
