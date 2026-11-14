@@ -66,6 +66,12 @@
 #define ADDR_WIFI_PASS 1040
 #define WIFI_MAX_SSID 33 // 32 символи SSID + завершальний нуль
 #define WIFI_MAX_PASS 64
+#ifndef WIFI_DEFAULT_SSID
+#define WIFI_DEFAULT_SSID ""
+#endif
+#ifndef WIFI_DEFAULT_PASSWORD
+#define WIFI_DEFAULT_PASSWORD ""
+#endif
 #define ADDR_CLICK_DURATION 1104
 #define ADDR_MQTT_HOST 1120
 #define MQTT_MAX_HOST 65
@@ -294,11 +300,10 @@ struct RelayCommand {
  uint8_t mask;
  uint32_t durationMs;
  bool holdOn;
+ bool stop;
 };
 
 QueueHandle_t relayCommandQueue = nullptr;
-portMUX_TYPE relayCommandMux = portMUX_INITIALIZER_UNLOCKED;
-uint8_t pendingRelayStopMask = 0;
 volatile uint32_t relayStatusVersion = 0;
 uint32_t lastPublishedRelayStatusVersion = 0;
 
@@ -1353,8 +1358,21 @@ const IPAddress AP_IP(192, 168, 4, 1);
 const IPAddress AP_GATEWAY(192, 168, 4, 1);
 const IPAddress AP_SUBNET(255, 255, 255, 0);
 
-String readWiFiSSID() { return eepromReadString(ADDR_WIFI_SSID, WIFI_MAX_SSID); }
-String readWiFiPass() { return eepromReadString(ADDR_WIFI_PASS, WIFI_MAX_PASS); }
+bool hasStoredWiFiCreds() {
+  uint32_t marker = 0;
+  EEPROM.get(ADDR_WIFI_FALLBACK_MARKER, marker);
+  return marker == WIFI_FALLBACK_MARKER;
+}
+String readWiFiSSID() {
+  return hasStoredWiFiCreds()
+      ? eepromReadString(ADDR_WIFI_SSID, WIFI_MAX_SSID)
+      : String(WIFI_DEFAULT_SSID);
+}
+String readWiFiPass() {
+  return hasStoredWiFiCreds()
+      ? eepromReadString(ADDR_WIFI_PASS, WIFI_MAX_PASS)
+      : String(WIFI_DEFAULT_PASSWORD);
+}
 String readMailFrom() { return eepromReadString(ADDR_MAIL_FROM, MAIL_MAX_ADDRESS); }
 String readMailTo() { return eepromReadString(ADDR_MAIL_TO, MAIL_MAX_ADDRESS); }
 String readMailAppPass() {
@@ -1380,9 +1398,7 @@ bool writeMailSettings(const String &from, const String &to,
          readMailAppPass() == appPass;
 }
 bool isWiFiFallbackConfigured() {
-  uint32_t marker = 0;
-  EEPROM.get(ADDR_WIFI_FALLBACK_MARKER, marker);
-  return marker == WIFI_FALLBACK_MARKER;
+  return hasStoredWiFiCreds() || strlen(WIFI_DEFAULT_SSID) > 0;
 }
 bool writeWiFiCreds(const String &ssid, const String &pass) {
   eepromWriteString(ADDR_WIFI_SSID, ssid, WIFI_MAX_SSID);
@@ -1672,8 +1688,9 @@ String readMqttTopic() {
 }
 
 bool pulseRelays(uint8_t mask, uint32_t durationMs) {
+  if ((mask & 0x03) == 0 || (mask & 0xFC) != 0) return false;
   durationMs = constrain(durationMs, 50UL, 60000UL);
-  RelayCommand command = {mask, durationMs, false};
+  RelayCommand command = {mask, durationMs, false, false};
   if (!relayCommandQueue ||
       xQueueSendToBack(relayCommandQueue, &command, 0) != pdTRUE) {
     Serial.println("Черга керування реле заповнена; імпульс відхилено.");
@@ -1683,7 +1700,8 @@ bool pulseRelays(uint8_t mask, uint32_t durationMs) {
 }
 
 bool turnRelaysOn(uint8_t mask) {
-  RelayCommand command = {mask, 0, true};
+  if ((mask & 0x03) == 0 || (mask & 0xFC) != 0) return false;
+  RelayCommand command = {mask, 0, true, false};
   if (!relayCommandQueue ||
       xQueueSendToBack(relayCommandQueue, &command, 0) != pdTRUE) {
     Serial.println("Черга керування реле заповнена; постійне ввімкнення відхилено.");
@@ -1693,10 +1711,13 @@ bool turnRelaysOn(uint8_t mask) {
 }
 
 bool stopRelays(uint8_t mask) {
-  if (!relayCommandQueue) return false;
-  portENTER_CRITICAL(&relayCommandMux);
-  pendingRelayStopMask |= mask;
-  portEXIT_CRITICAL(&relayCommandMux);
+  if ((mask & 0x03) == 0 || (mask & 0xFC) != 0) return false;
+  RelayCommand command = {mask, 0, false, true};
+  if (!relayCommandQueue ||
+      xQueueSendToBack(relayCommandQueue, &command, 0) != pdTRUE) {
+    Serial.println("Черга керування реле заповнена; вимкнення відхилено.");
+    return false;
+  }
   return true;
 }
 
@@ -1721,7 +1742,7 @@ void relayTask(void *) {
       relay2_turnOffTime = 0;
       changed = true;
     }
-    if (changed) relayStatusVersion++;
+    if (changed) relayStatusVersion = relayStatusVersion + 1;
 
     size_t count = 0;
     RelayCommand command;
@@ -1730,18 +1751,30 @@ void relayTask(void *) {
       pending[count++] = command;
     }
 
-    uint8_t stopMask;
-    portENTER_CRITICAL(&relayCommandMux);
-    stopMask = pendingRelayStopMask;
-    pendingRelayStopMask = 0;
-    portEXIT_CRITICAL(&relayCommandMux);
-
     for (size_t i = 0; i < count; i++) {
-      uint8_t commandMask = pending[i].mask & (uint8_t)~stopMask;
-      if (!commandMask) continue;
+      uint8_t commandMask = pending[i].mask & 0x03;
+      bool changedState = false;
+      if (pending[i].stop) {
+        if (commandMask & 0x01) {
+          digitalWrite(RELAY_1, LOW);
+          changedState |= relay1_active;
+          relay1_active = false;
+          relay1_timed = false;
+          relay1_turnOffTime = 0;
+        }
+        if (commandMask & 0x02) {
+          digitalWrite(RELAY_2, LOW);
+          changedState |= relay2_active;
+          relay2_active = false;
+          relay2_timed = false;
+          relay2_turnOffTime = 0;
+        }
+        if (changedState) relayStatusVersion = relayStatusVersion + 1;
+        continue;
+      }
+
       uint32_t offAt = pending[i].holdOn
           ? 0 : millis() + pending[i].durationMs;
-      bool changedState = false;
       if (commandMask & 0x01) {
         digitalWrite(RELAY_1, HIGH);
         changedState |= !relay1_active;
@@ -1756,25 +1789,8 @@ void relayTask(void *) {
         relay2_timed = !pending[i].holdOn;
         relay2_turnOffTime = relay2_timed ? offAt : 0;
       }
-      if (changedState) relayStatusVersion++;
+      if (changedState) relayStatusVersion = relayStatusVersion + 1;
     }
-
-    bool changedState = false;
-    if (stopMask & 0x01) {
-      digitalWrite(RELAY_1, LOW);
-      changedState |= relay1_active;
-      relay1_active = false;
-      relay1_timed = false;
-      relay1_turnOffTime = 0;
-    }
-    if (stopMask & 0x02) {
-      digitalWrite(RELAY_2, LOW);
-      changedState |= relay2_active;
-      relay2_active = false;
-      relay2_timed = false;
-      relay2_turnOffTime = 0;
-    }
-    if (changedState) relayStatusVersion++;
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
@@ -2665,6 +2681,9 @@ void handleStatusAPI() {
   doc["network"] = network;
   doc["ip"] = ip;
   doc["duration"] = clickDuration;
+  time_t now;
+  time(&now);
+  doc["epoch"] = now >= 1704067200 ? (uint32_t)now : 0;
   String json;
   serializeJson(doc, json);
   server.send(200, "application/json", json);
@@ -3302,7 +3321,8 @@ void setup() {
 
   // Ініціалізація Ethernet
   Serial.println("Запускаю Ethernet; NFC і реле працюють незалежно від мережі.");
-  bool ethStarted = ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN, ETH_MDIO_PIN, ETH_TYPE, ETH_CLK_MODE);
+  bool ethStarted = ETH.begin(ETH_TYPE, ETH_ADDR, ETH_MDC_PIN, ETH_MDIO_PIN,
+                              ETH_POWER_PIN, ETH_CLK_MODE);
   if (!ethStarted) Serial.println("Не вдалося запустити Ethernet PHY.");
   pn532SPI.begin(PN532_SPI_SCK, PN532_SPI_MISO, PN532_SPI_MOSI,
                  PN532_SPI_CS);

@@ -36,7 +36,11 @@
       <form id="searchForm" class="row">
         <input id="cardSearch" type="search" placeholder="Пошук: UID, ПІБ, авто, дата народження, адреса, телефон">
         <button type="submit">Знайти</button><button id="clearSearch" type="button">Очистити</button>
+        <button id="markArrived" type="button">Позначити «Прибув»</button>
+        <button id="markDeparted" type="button">Позначити «Вибув»</button>
       </form>
+      <p>Спочатку виберіть картку в результатах пошуку або одну чи кілька присутніх номерних рамок нижче.</p>
+      <p id="attendanceStatus" role="status"></p>
       <p id="cardListStatus" role="status">Завантаження списку...</p>
       <div class="tableWrap"><table><thead><tr><th>#</th><th>UID</th><th>Прізвище</th><th>Ім’я</th><th>По батькові</th><th>Авто</th><th>Народження</th><th>Адреса</th><th>Телефон</th><th>Реле</th><th>Дії</th></tr></thead><tbody id="cards"></tbody></table></div>
     </section>
@@ -57,19 +61,8 @@
       <p id="formStatus" role="status"></p>
     </section>
     <section class="card">
-      <h2>Останні зчитування та облік</h2>
-      <h3>Останні 10 зчитаних UID / номерів авто</h3>
-      <div id="recentReads" class="activityGrid" role="group" aria-label="Останні зчитані картки"></div>
-      <div class="row"><button id="markArrived">Позначити «Прибув»</button><button id="markDeparted">Позначити «Вибув»</button></div>
-      <p id="attendanceStatus" role="status"></p>
-      <div class="activityColumns">
-        <div class="activityColumn"><h3>Прибули (останні 10)</h3><ol id="arrivals"></ol></div>
-        <div class="activityColumn"><h3>Вибули (останні 10)</h3><ol id="departures"></ol></div>
-      </div>
-    </section>
-    <section class="card">
       <h2>Присутні зараз <span id="presentCount">0</span></h2>
-      <p>Номерні рамки заповнюються автомобілями, позначеними як присутні. Натисніть на заповнену рамку, щоб вибрати авто; цей вибір не змінює стан присутності. Показано щонайменше шість місць, нові рамки додаються за потреби.</p>
+      <p>Номерні рамки заповнюються автомобілями, позначеними як присутні. Виберіть одну або кілька рамок, потім натисніть «Позначити “Вибув”» біля пошуку, щоб прибрати їх із присутніх. Пошуком можна вибрати й позначити прибуття для будь-якої зареєстрованої картки. Показано щонайменше шість місць, нові рамки додаються за потреби.</p>
       <div id="presentVehicles" class="presenceGrid" aria-label="Присутні автомобілі"></div>
       <p id="presenceStatus" role="status">Завантаження списку присутніх...</p>
       <h3>Вибрані присутні автомобілі (до 10)</h3>
