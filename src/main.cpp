@@ -3321,8 +3321,8 @@ void setup() {
 
   // Ініціалізація Ethernet
   Serial.println("Запускаю Ethernet; NFC і реле працюють незалежно від мережі.");
-  bool ethStarted = ETH.begin(ETH_TYPE, ETH_ADDR, ETH_MDC_PIN, ETH_MDIO_PIN,
-                              ETH_POWER_PIN, ETH_CLK_MODE);
+  bool ethStarted = ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN, ETH_MDIO_PIN,
+                              ETH_TYPE, ETH_CLK_MODE);
   if (!ethStarted) Serial.println("Не вдалося запустити Ethernet PHY.");
   pn532SPI.begin(PN532_SPI_SCK, PN532_SPI_MISO, PN532_SPI_MOSI,
                  PN532_SPI_CS);
