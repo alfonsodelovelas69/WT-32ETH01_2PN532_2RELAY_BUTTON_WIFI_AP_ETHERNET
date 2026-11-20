@@ -269,7 +269,7 @@ const char* webPass = "ChangeMe123!"; // Змініть на свій парол
 class SemaphoreGuard {
 public:
   explicit SemaphoreGuard(SemaphoreHandle_t mutex,
-                          TickType_t wait = portMAX_DELAY)
+                          TickType_t wait = pdMS_TO_TICKS(250))
       : mutex_(mutex), locked_(mutex_ &&
           xSemaphoreTake(mutex_, wait) == pdTRUE) {}
   ~SemaphoreGuard() {
@@ -1982,6 +1982,12 @@ void publishMqttCommandResult(const char *command, bool ok) {
 }
 
 void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
+  Serial.print("MQTT отримано повідомлення: ");
+  Serial.print(topic);
+  Serial.print(" (");
+  Serial.print(length);
+  Serial.println(" байт)");
+
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, payload, length);
   if (error) {
@@ -2140,7 +2146,12 @@ void serviceMqtt(unsigned long now) {
   }
 
   if (mqttClient.connected()) {
-    mqttClient.loop();
+    bool loopOk = mqttClient.loop();
+    if (!loopOk || !mqttClient.connected()) {
+      Serial.print("MQTT-з'єднання втрачено під час обслуговування, код: ");
+      Serial.println(mqttClient.state());
+      return;
+    }
     if (now - lastMqttStatusPublish >= MQTT_STATUS_INTERVAL ||
         lastPublishedNfcPresent != nfcPresent ||
         lastPublishedNfc2Present != nfc2Present ||
@@ -3387,6 +3398,7 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
   mqttClient.setBufferSize(2048);
+  mqttClient.setKeepAlive(60);
   Serial.println("Веб-сервер запущено на порті 80");
   Serial.println("Очікую IP Ethernet; якщо зв'язку не буде — підключу WiFi або локальну AP.");
 
