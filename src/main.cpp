@@ -292,8 +292,8 @@ private:
 
 // -------------------- Змінні --------------------
 String lastScannedUID = "";
-bool nfcPresent = false;
-bool nfc2Present = false;
+volatile bool nfcPresent = false;
+volatile bool nfc2Present = false;
 int clickDuration = 1000;
 
 struct RelayCommand {
@@ -301,6 +301,7 @@ struct RelayCommand {
  uint32_t durationMs;
  bool holdOn;
  bool stop;
+ uint32_t enqueuedAt;
 };
 
 QueueHandle_t relayCommandQueue = nullptr;
@@ -321,13 +322,9 @@ const unsigned long NFC_POLL_INTERVAL = 400; // ms
 const unsigned long CARD_REARM_MS = 800;
 String presentedUID = "";
 unsigned long lastCardSeen = 0;
-unsigned long lastNfcInitAttempt = 0;
-unsigned long lastNfcFailureLog = 0;
 String presentedUID2 = "";
 unsigned long lastCardSeen2 = 0;
 unsigned long lastNFCRead2 = 0;
-unsigned long lastNfc2InitAttempt = 0;
-unsigned long lastNfc2FailureLog = 0;
 unsigned long lastNetworkCheck = 0;
 volatile bool mailTaskRunning = false;
 volatile bool mailTaskFinished = false;
@@ -1690,7 +1687,7 @@ String readMqttTopic() {
 bool pulseRelays(uint8_t mask, uint32_t durationMs) {
   if ((mask & 0x03) == 0 || (mask & 0xFC) != 0) return false;
   durationMs = constrain(durationMs, 50UL, 60000UL);
-  RelayCommand command = {mask, durationMs, false, false};
+  RelayCommand command = {mask, durationMs, false, false, millis()};
   if (!relayCommandQueue ||
       xQueueSendToBack(relayCommandQueue, &command, 0) != pdTRUE) {
     Serial.println("Черга керування реле заповнена; імпульс відхилено.");
@@ -1701,7 +1698,7 @@ bool pulseRelays(uint8_t mask, uint32_t durationMs) {
 
 bool turnRelaysOn(uint8_t mask) {
   if ((mask & 0x03) == 0 || (mask & 0xFC) != 0) return false;
-  RelayCommand command = {mask, 0, true, false};
+  RelayCommand command = {mask, 0, true, false, millis()};
   if (!relayCommandQueue ||
       xQueueSendToBack(relayCommandQueue, &command, 0) != pdTRUE) {
     Serial.println("Черга керування реле заповнена; постійне ввімкнення відхилено.");
@@ -1712,7 +1709,7 @@ bool turnRelaysOn(uint8_t mask) {
 
 bool stopRelays(uint8_t mask) {
   if ((mask & 0x03) == 0 || (mask & 0xFC) != 0) return false;
-  RelayCommand command = {mask, 0, false, true};
+  RelayCommand command = {mask, 0, false, true, millis()};
   if (!relayCommandQueue ||
       xQueueSendToBack(relayCommandQueue, &command, 0) != pdTRUE) {
     Serial.println("Черга керування реле заповнена; вимкнення відхилено.");
@@ -1721,8 +1718,21 @@ bool stopRelays(uint8_t mask) {
   return true;
 }
 
+void removePendingRelayCommand(RelayCommand *pending, size_t &count,
+                               size_t index) {
+  for (size_t i = index; i + 1 < count; i++) {
+    pending[i] = pending[i + 1];
+  }
+  count--;
+}
+
 void relayTask(void *) {
+  const uint32_t pulseOffGapMs = 100;
   RelayCommand pending[24];
+  size_t pendingCount = 0;
+  uint32_t relay1PulseReadyAt = 0;
+  uint32_t relay2PulseReadyAt = 0;
+
   for (;;) {
     uint32_t now = millis();
     bool changed = false;
@@ -1732,6 +1742,7 @@ void relayTask(void *) {
       relay1_active = false;
       relay1_timed = false;
       relay1_turnOffTime = 0;
+      relay1PulseReadyAt = now + pulseOffGapMs;
       changed = true;
     }
     if (relay2_active && relay2_timed &&
@@ -1740,57 +1751,134 @@ void relayTask(void *) {
       relay2_active = false;
       relay2_timed = false;
       relay2_turnOffTime = 0;
+      relay2PulseReadyAt = now + pulseOffGapMs;
       changed = true;
     }
-    if (changed) relayStatusVersion = relayStatusVersion + 1;
 
-    size_t count = 0;
     RelayCommand command;
-    while (count < sizeof(pending) / sizeof(pending[0]) &&
+    while (pendingCount < sizeof(pending) / sizeof(pending[0]) &&
            xQueueReceive(relayCommandQueue, &command, 0) == pdTRUE) {
-      pending[count++] = command;
+      pending[pendingCount++] = command;
     }
 
-    for (size_t i = 0; i < count; i++) {
-      uint8_t commandMask = pending[i].mask & 0x03;
-      bool changedState = false;
-      if (pending[i].stop) {
-        if (commandMask & 0x01) {
-          digitalWrite(RELAY_1, LOW);
-          changedState |= relay1_active;
-          relay1_active = false;
-          relay1_timed = false;
-          relay1_turnOffTime = 0;
-        }
-        if (commandMask & 0x02) {
-          digitalWrite(RELAY_2, LOW);
-          changedState |= relay2_active;
-          relay2_active = false;
-          relay2_timed = false;
-          relay2_turnOffTime = 0;
-        }
-        if (changedState) relayStatusVersion = relayStatusVersion + 1;
+    for (size_t i = 0; i < pendingCount;) {
+      if (!pending[i].stop) {
+        i++;
         continue;
       }
 
-      uint32_t offAt = pending[i].holdOn
-          ? 0 : millis() + pending[i].durationMs;
+      uint8_t commandMask = pending[i].mask & 0x03;
+      size_t stopIndex = i;
+      for (size_t j = 0; j < stopIndex;) {
+        uint8_t overlap = pending[j].mask & commandMask;
+        if (overlap == 0) {
+          j++;
+          continue;
+        }
+        pending[j].mask = (uint8_t)(pending[j].mask & (uint8_t)~commandMask);
+        if (pending[j].mask == 0) {
+          removePendingRelayCommand(pending, pendingCount, j);
+          stopIndex--;
+        } else {
+          j++;
+        }
+      }
+
+      removePendingRelayCommand(pending, pendingCount, stopIndex);
+      if (commandMask & 0x01) {
+        if (relay1_active) changed = true;
+        digitalWrite(RELAY_1, LOW);
+        relay1_active = false;
+        relay1_timed = false;
+        relay1_turnOffTime = 0;
+        relay1PulseReadyAt = now + pulseOffGapMs;
+      }
+      if (commandMask & 0x02) {
+        if (relay2_active) changed = true;
+        digitalWrite(RELAY_2, LOW);
+        relay2_active = false;
+        relay2_timed = false;
+        relay2_turnOffTime = 0;
+        relay2PulseReadyAt = now + pulseOffGapMs;
+      }
+      i = 0;
+    }
+
+    for (size_t i = 0; i < pendingCount;) {
+      RelayCommand current = pending[i];
+      uint8_t commandMask = current.mask & 0x03;
+      if (commandMask == 0) {
+        removePendingRelayCommand(pending, pendingCount, i);
+        continue;
+      }
+
+      bool pulse = !current.holdOn;
+      bool relay1Busy = (commandMask & 0x01) && relay1_active &&
+                        relay1_timed;
+      bool relay2Busy = (commandMask & 0x02) && relay2_active &&
+                        relay2_timed;
+      if (relay1Busy || relay2Busy) {
+        i++;
+        continue;
+      }
+
+      bool relay1Gap = (commandMask & 0x01) &&
+          (int32_t)(now - relay1PulseReadyAt) < 0;
+      bool relay2Gap = (commandMask & 0x02) &&
+          (int32_t)(now - relay2PulseReadyAt) < 0;
+      if (relay1Gap || relay2Gap) {
+        i++;
+        continue;
+      }
+
+      if (pulse && (((commandMask & 0x01) && relay1_active) ||
+                    ((commandMask & 0x02) && relay2_active))) {
+        if (commandMask & 0x01) {
+          digitalWrite(RELAY_1, LOW);
+          relay1_active = false;
+          relay1_timed = false;
+          relay1_turnOffTime = 0;
+          relay1PulseReadyAt = now + pulseOffGapMs;
+        }
+        if (commandMask & 0x02) {
+          digitalWrite(RELAY_2, LOW);
+          relay2_active = false;
+          relay2_timed = false;
+          relay2_turnOffTime = 0;
+          relay2PulseReadyAt = now + pulseOffGapMs;
+        }
+        changed = true;
+        i++;
+        continue;
+      }
+
+      uint32_t startedAt = millis();
+      uint32_t offAt = startedAt + current.durationMs;
+      bool changedState = false;
       if (commandMask & 0x01) {
         digitalWrite(RELAY_1, HIGH);
         changedState |= !relay1_active;
         relay1_active = true;
-        relay1_timed = !pending[i].holdOn;
-        relay1_turnOffTime = relay1_timed ? offAt : 0;
+        relay1_timed = pulse;
+        relay1_turnOffTime = pulse ? offAt : 0;
       }
       if (commandMask & 0x02) {
         digitalWrite(RELAY_2, HIGH);
         changedState |= !relay2_active;
         relay2_active = true;
-        relay2_timed = !pending[i].holdOn;
-        relay2_turnOffTime = relay2_timed ? offAt : 0;
+        relay2_timed = pulse;
+        relay2_turnOffTime = pulse ? offAt : 0;
       }
-      if (changedState) relayStatusVersion = relayStatusVersion + 1;
+      if (changedState) changed = true;
+      if (pulse) {
+        Serial.printf("Реле: імпульс mask=%u, очікування в черзі=%lu мс\n",
+                      commandMask,
+                      (unsigned long)(startedAt - current.enqueuedAt));
+      }
+      removePendingRelayCommand(pending, pendingCount, i);
     }
+
+    if (changed) relayStatusVersion = relayStatusVersion + 1;
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
@@ -1982,6 +2070,9 @@ void publishMqttCommandResult(const char *command, bool ok) {
 }
 
 void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
+  Serial.print("[");
+  Serial.print(millis());
+  Serial.print(" ms] ");
   Serial.print("MQTT отримано повідомлення: ");
   Serial.print(topic);
   Serial.print(" (");
@@ -2233,6 +2324,30 @@ bool initializePN532SPI() {
   nfc2Present = true;
   Serial.println("PN532 №2 знайдено в режимі SPI.");
   return true;
+}
+
+void pn532I2cInitTask(void *) {
+  uint32_t lastFailureLog = millis() - 30000;
+  for (;;) {
+    if (!nfcPresent && !initializePN532() &&
+        millis() - lastFailureLog >= 30000) {
+      Serial.println("PN532 поки не знайдено; перевірте режим I2C, живлення та SDA/SCL; повторні спроби тривають.");
+      lastFailureLog = millis();
+    }
+    vTaskDelay(pdMS_TO_TICKS(NFC_RETRY_INTERVAL));
+  }
+}
+
+void pn532SpiInitTask(void *) {
+  uint32_t lastFailureLog = millis() - 30000;
+  for (;;) {
+    if (!nfc2Present && !initializePN532SPI() &&
+        millis() - lastFailureLog >= 30000) {
+      Serial.println("PN532 №2 не знайдено; перевірте режим SPI, SCK/MISO/MOSI/CS та живлення.");
+      lastFailureLog = millis();
+    }
+    vTaskDelay(pdMS_TO_TICKS(NFC_RETRY_INTERVAL));
+  }
 }
 
 void handleScannedCard(const String &uid, uint8_t readerNumber) {
@@ -3402,11 +3517,15 @@ void setup() {
   Serial.println("Веб-сервер запущено на порті 80");
   Serial.println("Очікую IP Ethernet; якщо зв'язку не буде — підключу WiFi або локальну AP.");
 
-  // Network and web startup must not wait for a PN532 I2C response.
-  lastNfcInitAttempt = millis() - NFC_RETRY_INTERVAL;
-  lastNfcFailureLog = millis() - 30000;
-  lastNfc2InitAttempt = millis() - NFC_RETRY_INTERVAL;
-  lastNfc2FailureLog = millis() - 30000;
+  // Keep missing readers from blocking MQTT service in the Arduino loop.
+  if (xTaskCreatePinnedToCore(pn532I2cInitTask, "pn532-i2c-init", 4096,
+                              nullptr, 1, nullptr, 0) != pdPASS) {
+    Serial.println("Не вдалося запустити фонову ініціалізацію PN532 I2C.");
+  }
+  if (xTaskCreatePinnedToCore(pn532SpiInitTask, "pn532-spi-init", 4096,
+                              nullptr, 1, nullptr, 0) != pdPASS) {
+    Serial.println("Не вдалося запустити фонову ініціалізацію PN532 SPI.");
+  }
 }
 
 // -------------------- Loop --------------------
@@ -3438,21 +3557,6 @@ void loop() {
       cardStatsDirty = false;
     } else {
       Serial.println("Статистика зчитувань залишилася незбереженою; буде повторна спроба.");
-    }
-  }
-
-  if (!nfcPresent && now - lastNfcInitAttempt >= NFC_RETRY_INTERVAL) {
-    lastNfcInitAttempt = now;
-    if (!initializePN532() && now - lastNfcFailureLog >= 30000) {
-      Serial.println("PN532 поки не знайдено; перевірте режим I2C, живлення та SDA/SCL; повторні спроби тривають.");
-      lastNfcFailureLog = now;
-    }
-  }
-  if (!nfc2Present && now - lastNfc2InitAttempt >= NFC_RETRY_INTERVAL) {
-    lastNfc2InitAttempt = now;
-    if (!initializePN532SPI() && now - lastNfc2FailureLog >= 30000) {
-      Serial.println("PN532 №2 не знайдено; перевірте режим SPI, SCK/MISO/MOSI/CS та живлення.");
-      lastNfc2FailureLog = now;
     }
   }
 
